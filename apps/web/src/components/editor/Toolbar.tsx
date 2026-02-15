@@ -693,29 +693,29 @@ export const Toolbar: React.FC = () => {
     recommended?: boolean;
     separator?: boolean;
   }> = [
-    {
-      label: getRecommendedLabel(),
-      icon: Zap,
-      desc: `${projectRes} H.264 - Best for your video`,
-      type: "mp4",
-      recommended: true,
-    },
-    {
-      label: "Project Resolution",
-      icon: Film,
-      desc: `${projectRes} H.264 - High quality`,
-      type: "project",
-    },
-    {
-      label: "",
-      icon: Film,
-      desc: "",
-      type: "mp4",
-      separator: true,
-    },
-    ...(isVertical
-      ? []
-      : [
+      {
+        label: getRecommendedLabel(),
+        icon: Zap,
+        desc: `${projectRes} H.264 - Best for your video`,
+        type: "mp4",
+        recommended: true,
+      },
+      {
+        label: "Project Resolution",
+        icon: Film,
+        desc: `${projectRes} H.264 - High quality`,
+        type: "project",
+      },
+      {
+        label: "",
+        icon: Film,
+        desc: "",
+        type: "mp4",
+        separator: true,
+      },
+      ...(isVertical
+        ? []
+        : [
           {
             label: "4K Standard",
             icon: FileVideo,
@@ -723,108 +723,42 @@ export const Toolbar: React.FC = () => {
             type: "4k" as ExportType,
           },
         ]),
-    {
-      label: "1080p High Quality",
-      icon: FileVideo,
-      desc: "1920×1080 30fps - High bitrate",
-      type: "1080p-high",
-    },
-    {
-      label: "1080p 60fps",
-      icon: FileVideo,
-      desc: "1920×1080 - Smooth playback",
-      type: "1080p-60",
-    },
-    {
-      label: "MP4 Standard",
-      icon: FileVideo,
-      desc: `${projectRes} - Web & social`,
-      type: "mp4",
-    },
-    {
-      label: "Audio Only (WAV)",
-      icon: Music,
-      desc: "Uncompressed audio",
-      type: "wav",
-    },
-  ];
+      {
+        label: "1080p High Quality",
+        icon: FileVideo,
+        desc: "1920×1080 30fps - High bitrate",
+        type: "1080p-high",
+      },
+      {
+        label: "1080p 60fps",
+        icon: FileVideo,
+        desc: "1920×1080 - Smooth playback",
+        type: "1080p-60",
+      },
+      {
+        label: "MP4 Standard",
+        icon: FileVideo,
+        desc: `${projectRes} - Web & social`,
+        type: "mp4",
+      },
+      {
+        label: "Audio Only (WAV)",
+        icon: Music,
+        desc: "Uncompressed audio",
+        type: "wav",
+      },
+    ];
 
   return (
     <div className="h-16 border-b border-border flex items-center px-6 justify-between bg-background shrink-0 z-30 relative">
       <div className="flex items-center gap-4">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 group">
-            <svg
-              viewBox="0 0 490 490"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              className="w-full h-full text-primary group-hover:scale-110 transition-transform duration-300"
-            >
-              <path
-                d="M245 24.5C123.223 24.5 24.5 123.223 24.5 245s98.723 220.5 220.5 220.5 220.5-98.723 220.5-220.5S366.777 24.5 245 24.5Z"
-                stroke="currentColor"
-                strokeWidth="30.625"
-                className="opacity-100"
-              />
-              <g className="origin-center group-hover:rotate-90 transition-transform duration-500 ease-out">
-                <path
-                  d="M245 98v73.5"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="M392 245h-73.5"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="M245 392v-73.5"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="M98 245h73.5"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="m348.941 141.059-51.965 51.965"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="m348.941 348.941-51.965-51.965"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="m141.059 348.941 51.965-51.965"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-                <path
-                  d="m141.059 141.059 51.965 51.965"
-                  stroke="currentColor"
-                  strokeWidth="24.5"
-                  strokeLinecap="round"
-                />
-              </g>
-              <path
-                d="M294 245a49 49 0 0 1-49 49 49 49 0 0 1-49-49 49 49 0 0 1 98 0"
-                fill="currentColor"
-                className="group-hover:fill-white transition-colors duration-300"
-              />
-            </svg>
+            <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="500" zoomAndPan="magnify" viewBox="0 0 375 374.999991" height="500" preserveAspectRatio="xMidYMid meet" version="1.0"><defs><clipPath id="54bb3abc63"><path d="M 2 17 L 373 17 L 373 358.945312 L 2 358.945312 Z M 2 17 " clip-rule="nonzero" /></clipPath><clipPath id="bdc29e04f7"><path d="M 79.714844 118.023438 L 294.964844 118.023438 L 294.964844 333.273438 L 79.714844 333.273438 Z M 79.714844 118.023438 " clip-rule="nonzero" /></clipPath></defs><g clip-path="url(#54bb3abc63)"><path fill="#135bf9" d="M 363.816406 149.554688 L 322.445312 117.261719 C 322.449219 117.113281 322.457031 116.96875 322.457031 116.820312 L 322.457031 47.542969 C 322.457031 38.683594 315.273438 31.503906 306.414062 31.503906 L 285.074219 31.503906 C 276.214844 31.503906 269.03125 38.683594 269.03125 47.542969 L 269.03125 75.570312 L 200.78125 22.292969 C 192.96875 16.195312 182.007812 16.195312 174.195312 22.292969 L 11.160156 149.554688 C -5.039062 162.199219 3.902344 188.1875 24.453125 188.1875 L 52.519531 188.1875 L 52.519531 346.503906 C 52.519531 353.296875 58.027344 358.804688 64.824219 358.804688 L 310.152344 358.804688 C 316.945312 358.804688 322.457031 353.296875 322.457031 346.503906 L 322.457031 188.1875 L 350.523438 188.1875 C 371.074219 188.1875 380.015625 162.199219 363.816406 149.554688 Z M 363.816406 149.554688 " fill-opacity="1" fill-rule="nonzero" /></g><g clip-path="url(#bdc29e04f7)"><path fill="#ffffff" d="M 187.5 118.023438 C 128.058594 118.023438 79.738281 166.386719 79.738281 225.828125 C 79.738281 285.269531 128.058594 333.589844 187.5 333.589844 C 246.941406 333.589844 295.261719 285.269531 295.261719 225.828125 C 295.261719 166.386719 246.941406 118.023438 187.5 118.023438 Z M 187.5 316.132812 C 137.710938 316.132812 97.195312 275.613281 97.195312 225.828125 C 97.195312 176.042969 137.710938 135.523438 187.5 135.523438 C 237.285156 135.523438 277.804688 176.042969 277.804688 225.828125 C 277.804688 275.613281 237.285156 316.132812 187.5 316.132812 Z M 187.5 316.132812 " fill-opacity="1" fill-rule="nonzero" /></g><path fill="#ffffff" d="M 235.472656 222.597656 L 159.09375 178.5 C 156.636719 177.078125 153.53125 178.84375 153.53125 181.691406 L 153.53125 269.925781 C 153.53125 272.769531 156.636719 274.539062 159.09375 273.113281 L 235.515625 229.019531 C 237.972656 227.597656 237.972656 224.019531 235.472656 222.597656 Z M 235.472656 222.597656 " fill-opacity="1" fill-rule="nonzero" /></svg>
           </div>
           <span className="text-lg font-medium text-text-primary tracking-wide hidden lg:block">
-            Open Reel
+            <p>VideoEstate.ai</p>
+            <p className="text-xs text-text-muted">Editor</p>
           </span>
         </div>
         <div className="h-6 w-px bg-border hidden md:block" />
@@ -833,34 +767,30 @@ export const Toolbar: React.FC = () => {
 
       <div className="flex-1 max-w-2xl mx-12 relative group">
         <div
-          className={`absolute inset-0 bg-primary/20 rounded-xl blur-md transition-opacity duration-300 ${
-            hasSelectedClip
+          className={`absolute inset-0 bg-primary/20 rounded-xl blur-md transition-opacity duration-300 ${hasSelectedClip
               ? "opacity-100 animate-pulse"
               : "opacity-0 group-hover:opacity-100"
-          }`}
+            }`}
         />
         <button
           onClick={handleSearch}
-          className={`relative w-full bg-background-secondary border rounded-xl h-10 flex items-center px-4 gap-3 transition-all text-left shadow-inner ${
-            hasSelectedClip
+          className={`relative w-full bg-background-secondary border rounded-xl h-10 flex items-center px-4 gap-3 transition-all text-left shadow-inner ${hasSelectedClip
               ? "border-primary/50 ring-1 ring-primary/30"
               : "border-border group-hover:border-primary/50"
-          }`}
+            }`}
         >
           <Search
             size={16}
-            className={`transition-colors ${
-              hasSelectedClip
+            className={`transition-colors ${hasSelectedClip
                 ? "text-primary"
                 : "text-text-muted group-hover:text-primary"
-            }`}
+              }`}
           />
           <span
-            className={`flex-1 text-sm transition-colors ${
-              hasSelectedClip
+            className={`flex-1 text-sm transition-colors ${hasSelectedClip
                 ? "text-text-secondary"
                 : "text-text-muted group-hover:text-text-secondary"
-            }`}
+              }`}
           >
             {hasSelectedClip
               ? "Search effects for selected clip..."
@@ -937,11 +867,10 @@ export const Toolbar: React.FC = () => {
           <TooltipTrigger asChild>
             <button
               onClick={toggleKeyframeEditor}
-              className={`p-2 rounded-lg transition-colors ${
-                keyframeEditorOpen
+              className={`p-2 rounded-lg transition-colors ${keyframeEditorOpen
                   ? "bg-primary/20 text-primary"
                   : "hover:bg-background-elevated text-text-secondary hover:text-text-primary"
-              }`}
+                }`}
             >
               <Diamond size={16} />
             </button>
@@ -955,11 +884,10 @@ export const Toolbar: React.FC = () => {
           <TooltipTrigger asChild>
             <button
               onClick={() => setIsHistoryOpen(!isHistoryOpen)}
-              className={`p-2 rounded-lg transition-colors ${
-                isHistoryOpen
+              className={`p-2 rounded-lg transition-colors ${isHistoryOpen
                   ? "bg-primary/20 text-primary"
                   : "hover:bg-background-elevated text-text-secondary hover:text-text-primary"
-              }`}
+                }`}
             >
               <History size={16} />
             </button>
@@ -1027,16 +955,14 @@ export const Toolbar: React.FC = () => {
             <DropdownMenu open={isExportOpen} onOpenChange={setIsExportOpen}>
               <DropdownMenuTrigger asChild>
                 <button
-                  className={`h-10 px-4 bg-primary hover:bg-primary-hover active:bg-primary-active text-white font-bold rounded-lg flex items-center gap-2 transition-all shadow-[0_0_20px_rgba(34,197,94,0.3)] hover:shadow-[0_0_30px_rgba(34,197,94,0.5)] transform hover:-translate-y-0.5 ${
-                    isExportOpen ? "translate-y-0 shadow-none" : ""
-                  }`}
+                  className={`h-10 px-4 bg-primary hover:bg-primary-hover active:bg-primary-active text-white font-bold rounded-lg flex items-center gap-2 transition-all shadow-[0_0_20px_rgba(34,197,94,0.3)] hover:shadow-[0_0_30px_rgba(34,197,94,0.5)] transform hover:-translate-y-0.5 ${isExportOpen ? "translate-y-0 shadow-none" : ""
+                    }`}
                 >
                   <span className="text-sm tracking-wider">EXPORT</span>
                   <ChevronDown
                     size={14}
-                    className={`transition-transform duration-200 ${
-                      isExportOpen ? "rotate-180" : ""
-                    }`}
+                    className={`transition-transform duration-200 ${isExportOpen ? "rotate-180" : ""
+                      }`}
                   />
                 </button>
               </DropdownMenuTrigger>
@@ -1048,29 +974,26 @@ export const Toolbar: React.FC = () => {
                     ) : (
                       <DropdownMenuItem
                         key={option.type + index}
-                        className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer ${
-                          option.recommended
+                        className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer ${option.recommended
                             ? "bg-primary/10 hover:bg-primary/20 border border-primary/30"
                             : ""
-                        }`}
+                          }`}
                         onClick={() => handleExport(option.type)}
                       >
                         <div
-                          className={`p-2 rounded-lg transition-colors ${
-                            option.recommended
+                          className={`p-2 rounded-lg transition-colors ${option.recommended
                               ? "bg-primary/20 text-primary"
                               : "bg-background-tertiary group-hover:bg-background-elevated text-text-secondary group-hover:text-primary"
-                          }`}
+                            }`}
                         >
                           <option.icon size={18} />
                         </div>
                         <div className="flex-1">
                           <div
-                            className={`text-sm font-medium transition-colors ${
-                              option.recommended
+                            className={`text-sm font-medium transition-colors ${option.recommended
                                 ? "text-primary"
                                 : "text-text-primary"
-                            }`}
+                              }`}
                           >
                             {option.label}
                             {option.recommended && (
