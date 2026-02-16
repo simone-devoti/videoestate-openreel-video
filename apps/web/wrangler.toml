@@ -1,13 +1,13 @@
-name = "openreel"
+name = "videoestate-video-editor"
 compatibility_date = "2024-01-01"
 pages_build_output_dir = "dist"
 
-# Cloudflare Pages configuration for OpenReel video editor
+# Cloudflare Pages configuration for VideoEstate.ai video editor
 # This app requires special headers for SharedArrayBuffer (used by FFmpeg.wasm)
-# Custom domain: app.openreel.video
+# Custom domain: editor.videoestate.ai
 
 [env.production]
-name = "openreel"
+name = "videoestate-video-editor"
 
 [env.preview]
-name = "openreel-preview"
+name = "videoestate-video-editor-preview"

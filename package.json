@@ -1,5 +1,5 @@
 {
-  "name": "videoestate-video-editor",
+  "name": "openreel",
   "version": "0.1.0",
   "private": true,
   "description": "Professional video, audio, and photo editing in your browser",
@@ -9,8 +9,8 @@
     "build:wasm": "pnpm --filter @openreel/core build:wasm",
     "build": "pnpm build:wasm && pnpm --filter @openreel/web build",
     "preview": "pnpm --filter @openreel/web preview",
-    "deploy": "pnpm build && pnpm --filter @openreel/web deploy",
-    "deploy:preview": "pnpm build && pnpm --filter @openreel/web deploy:preview",
+    "deploy": "pnpm build && pnpm --filter @openreel/web run deploy",
+    "deploy:preview": "pnpm build && pnpm --filter @openreel/web run deploy:preview",
     "test": "pnpm -r test:run",
     "test:watch": "pnpm -r test",
     "lint": "pnpm -r lint",

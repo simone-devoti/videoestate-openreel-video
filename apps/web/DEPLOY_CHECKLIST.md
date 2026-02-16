@@ -123,7 +123,7 @@ If deployment has issues:
 
 ```bash
 # List deployments
-npx wrangler pages deployment list --project-name=openreel
+npx wrangler pages deployment list --project-name=videoestate-video-editor
 
 # The previous deployment is still accessible at its unique URL
 # You can promote it back in Cloudflare Dashboard
