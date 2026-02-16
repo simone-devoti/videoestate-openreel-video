@@ -4,6 +4,7 @@ export interface MediaLoaderOptions {
   filename?: string;
   mimeType?: string;
   timeout?: number;
+  onProgress?: (loaded: number, total: number) => void;
 }
 
 export interface MediaLoaderResult {
@@ -141,6 +142,7 @@ export async function fetchMediaFromUrl(
     filename: customFilename,
     mimeType: customMimeType,
     timeout = 30000,
+    onProgress,
   } = options;
   
   const parsedUrl = validateUrl(url);
@@ -195,10 +197,49 @@ export async function fetchMediaFromUrl(
     );
   }
   
+  // Get content length for progress tracking
+  const contentLength = response.headers.get("Content-Length");
+  const total = contentLength ? parseInt(contentLength, 10) : 0;
+  
   let blob: Blob;
   
   try {
-    blob = await response.blob();
+    if (onProgress && response.body) {
+      // Read stream with progress tracking
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let loaded = 0;
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) {
+          break;
+        }
+        
+        chunks.push(value);
+        loaded += value.length;
+        
+        // Call progress callback (use loaded as total if Content-Length not available)
+        onProgress(loaded, total > 0 ? total : loaded);
+      }
+      
+      // Combine all chunks into a single blob
+      const allChunks = new Uint8Array(loaded);
+      let position = 0;
+      for (const chunk of chunks) {
+        allChunks.set(chunk, position);
+        position += chunk.length;
+      }
+      
+      blob = new Blob([allChunks]);
+    } else {
+      // Fallback to standard blob() if no progress tracking needed
+      blob = await response.blob();
+      if (onProgress && blob.size > 0) {
+        onProgress(blob.size, blob.size);
+      }
+    }
   } catch (error) {
     throw new Error(
       `Failed to read response body: ${error instanceof Error ? error.message : "Unknown error"}`

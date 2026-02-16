@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef, useCallback } from "react";
+import { Loader2 } from "lucide-react";
 
 import { Toolbar } from "./Toolbar";
 import { AssetsPanel } from "./AssetsPanel";
@@ -16,6 +17,7 @@ import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
 import { useRouter } from "../../hooks/use-router";
 import { fetchMediaFromUrl } from "../../utils/media-url-loader";
 import { toast } from "../../stores/notification-store";
+import { Progress } from "@openreel/ui";
 import {
   initializePlaybackBridge,
   disposePlaybackBridge,
@@ -173,6 +175,15 @@ export const EditorInterface: React.FC = () => {
   const { params, updateParams } = useRouter();
   const tracks = project.timeline.tracks;
   const mediaUrlProcessedRef = useRef<string | null>(null);
+  const [mediaLoadingProgress, setMediaLoadingProgress] = useState<{
+    isLoading: boolean;
+    progress: number;
+    status: string;
+  }>({
+    isLoading: false,
+    progress: 0,
+    status: "",
+  });
 
   const [selectedKeyframeIds, setSelectedKeyframeIds] = React.useState<string[]>([]);
   const [copiedKeyframes, setCopiedKeyframes] = React.useState<import("@openreel/core").Keyframe[]>([]);
@@ -267,8 +278,32 @@ export const EditorInterface: React.FC = () => {
       mediaUrlProcessedRef.current = url;
 
       try {
-        // Fetch media from URL
-        const { file } = await fetchMediaFromUrl(url);
+        // Set loading state
+        setMediaLoadingProgress({
+          isLoading: true,
+          progress: 0,
+          status: "Fetching media...",
+        });
+
+        // Fetch media from URL with progress tracking
+        const { file } = await fetchMediaFromUrl(url, {
+          onProgress: (loaded: number, total: number) => {
+            const progress = total > 0 && total >= loaded ? (loaded / total) * 100 : 0;
+            setMediaLoadingProgress({
+              isLoading: true,
+              progress,
+              status: total > 0 && total >= loaded
+                ? `Downloading... ${Math.round(progress)}%`
+                : "Downloading...",
+            });
+          },
+        });
+
+        setMediaLoadingProgress({
+          isLoading: true,
+          progress: 100,
+          status: "Importing media...",
+        });
 
         // Import media
         const importResult = await importMedia(file);
@@ -280,8 +315,19 @@ export const EditorInterface: React.FC = () => {
           // Clear the parameter even on failure to prevent retry loops
           updateParams({ mediaUrl: undefined });
           mediaUrlProcessedRef.current = null;
+          setMediaLoadingProgress({
+            isLoading: false,
+            progress: 0,
+            status: "",
+          });
           return;
         }
+
+        setMediaLoadingProgress({
+          isLoading: true,
+          progress: 100,
+          status: "Adding to timeline...",
+        });
 
         // Add to timeline
         const addResult = await addClipToNewTrack(importResult.actionId);
@@ -300,6 +346,11 @@ export const EditorInterface: React.FC = () => {
         // Clear the parameter after successful import
         updateParams({ mediaUrl: undefined });
         mediaUrlProcessedRef.current = null;
+        setMediaLoadingProgress({
+          isLoading: false,
+          progress: 0,
+          status: "",
+        });
       } catch (error) {
         const errorMessage =
           error instanceof Error ? error.message : "Unknown error occurred";
@@ -319,6 +370,11 @@ export const EditorInterface: React.FC = () => {
         // Clear the parameter on error to prevent retry loops
         updateParams({ mediaUrl: undefined });
         mediaUrlProcessedRef.current = null;
+        setMediaLoadingProgress({
+          isLoading: false,
+          progress: 0,
+          status: "",
+        });
       }
     };
 
@@ -373,6 +429,46 @@ export const EditorInterface: React.FC = () => {
 
   return (
     <div className="w-full h-full bg-background flex flex-col overflow-hidden font-sans select-none relative z-20 text-xs text-text-secondary">
+      {/* Media Loading Overlay */}
+      {mediaLoadingProgress.isLoading && (
+        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-background-secondary/95 rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl border border-border">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
+                <Loader2 size={20} className="text-primary animate-spin" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-text-primary">
+                  Loading Media
+                </h3>
+                <p className="text-xs text-text-muted">
+                  {mediaLoadingProgress.status || "Please wait..."}
+                </p>
+              </div>
+            </div>
+
+            <div className="mb-4">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] text-text-secondary">
+                  Download Progress
+                </span>
+                <span className="text-[10px] text-text-muted font-mono">
+                  {Math.round(mediaLoadingProgress.progress)}%
+                </span>
+              </div>
+              <Progress 
+                value={mediaLoadingProgress.progress} 
+                className="h-2 bg-black/30" 
+              />
+            </div>
+
+            <p className="text-[10px] text-text-muted text-center">
+              Please wait while media is being loaded...
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Main App Toolbar */}
       <Toolbar />
 
