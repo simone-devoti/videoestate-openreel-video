@@ -13,6 +13,9 @@ import { useProjectStore } from "../../stores/project-store";
 import { useUIStore } from "../../stores/ui-store";
 import { useEngineStore } from "../../stores/engine-store";
 import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
+import { useRouter } from "../../hooks/use-router";
+import { fetchMediaFromUrl } from "../../utils/media-url-loader";
+import { toast } from "../../stores/notification-store";
 import {
   initializePlaybackBridge,
   disposePlaybackBridge,
@@ -166,8 +169,10 @@ export const EditorInterface: React.FC = () => {
   useAutoSave();
 
   const { keyframeEditorOpen, setKeyframeEditorOpen, getSelectedClipIds } = useUIStore();
-  const { project, updateClipKeyframes } = useProjectStore();
+  const { project, updateClipKeyframes, importMedia, addClipToNewTrack } = useProjectStore();
+  const { params, updateParams } = useRouter();
   const tracks = project.timeline.tracks;
+  const mediaUrlProcessedRef = useRef<string | null>(null);
 
   const [selectedKeyframeIds, setSelectedKeyframeIds] = React.useState<string[]>([]);
   const [copiedKeyframes, setCopiedKeyframes] = React.useState<import("@openreel/core").Keyframe[]>([]);
@@ -244,6 +249,81 @@ export const EditorInterface: React.FC = () => {
 
   const [timelineHeight, setTimelineHeight] = useState(320);
   const isDraggingRef = useRef(false);
+
+  // Handle mediaUrl query parameter
+  useEffect(() => {
+    // Only process if editor is initialized and we have a mediaUrl param
+    if (!initialized || !params.mediaUrl) {
+      return;
+    }
+
+    // Prevent duplicate processing of the same URL
+    if (mediaUrlProcessedRef.current === params.mediaUrl) {
+      return;
+    }
+
+    const loadMediaFromUrl = async () => {
+      const url = params.mediaUrl!;
+      mediaUrlProcessedRef.current = url;
+
+      try {
+        // Fetch media from URL
+        const { file } = await fetchMediaFromUrl(url);
+
+        // Import media
+        const importResult = await importMedia(file);
+
+        if (!importResult.success || !importResult.actionId) {
+          const errorMessage =
+            importResult.error?.message || "Failed to import media";
+          toast.error("Import failed", errorMessage);
+          // Clear the parameter even on failure to prevent retry loops
+          updateParams({ mediaUrl: undefined });
+          mediaUrlProcessedRef.current = null;
+          return;
+        }
+
+        // Add to timeline
+        const addResult = await addClipToNewTrack(importResult.actionId);
+
+        if (!addResult.success) {
+          const errorMessage =
+            addResult.error?.message || "Failed to add media to timeline";
+          toast.error("Failed to add to timeline", errorMessage);
+        } else {
+          toast.success(
+            "Media loaded",
+            `${file.name} has been imported and added to the timeline`,
+          );
+        }
+
+        // Clear the parameter after successful import
+        updateParams({ mediaUrl: undefined });
+        mediaUrlProcessedRef.current = null;
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : "Unknown error occurred";
+        
+        // Provide more specific error messages
+        if (errorMessage.includes("CORS")) {
+          toast.error(
+            "CORS error",
+            "The URL may not allow cross-origin access. The server needs to include appropriate CORS headers.",
+          );
+        } else if (errorMessage.includes("fetch")) {
+          toast.error("Network error", "Failed to fetch media from URL");
+        } else {
+          toast.error("Failed to load media", errorMessage);
+        }
+
+        // Clear the parameter on error to prevent retry loops
+        updateParams({ mediaUrl: undefined });
+        mediaUrlProcessedRef.current = null;
+      }
+    };
+
+    loadMediaFromUrl();
+  }, [initialized, params.mediaUrl, importMedia, addClipToNewTrack, updateParams]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
