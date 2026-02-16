@@ -531,7 +531,7 @@ export const useUIStore = create<UIState>()(
         },
       }),
       {
-        name: "openreel-ui-preferences",
+        name: "videoestate-video-editor-ui-preferences",
         // Only persist user preferences, not transient state (selections, drag state, modals)
         // This prevents localStorage bloat and ensures clean state on new sessions
         partialize: (state) => ({

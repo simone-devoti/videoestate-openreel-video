@@ -1,5 +1,5 @@
 /**
- * Zustand stores for OpenReel
+ * Zustand stores for VideoEstate.ai Video Editor
  *
  * Exports all stores for project, timeline, UI, and engine state management.
  */

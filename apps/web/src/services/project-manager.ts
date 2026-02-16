@@ -30,7 +30,7 @@ interface FileHandleWithPermissions extends FileSystemFileHandle {
   requestPermission?: (options: { mode: string }) => Promise<string>;
 }
 
-const PROJECT_DB_NAME = "openreel-projects";
+const PROJECT_DB_NAME = "videoestate-video-editor-projects";
 const PROJECT_DB_VERSION = 1;
 const PROJECTS_STORE = "projects";
 const RECENT_STORE = "recent";
@@ -277,7 +277,7 @@ class ProjectManager {
         suggestedName: `${project.name}.oreel`,
         types: [
           {
-            description: "OpenReel Project",
+            description: "VideoEstate.ai Video Editor Project",
             accept: { "application/json": [".oreel", ".json"] },
           },
         ],
@@ -345,7 +345,7 @@ class ProjectManager {
         const [handle] = await win.showOpenFilePicker!({
           types: [
             {
-              description: "OpenReel Project",
+              description: "VideoEstate.ai Video Editor Project",
               accept: { "application/json": [".oreel", ".json"] },
             },
           ],

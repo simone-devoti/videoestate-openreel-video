@@ -1,5 +1,5 @@
 /**
- * OpenReel Service Worker
+ * VideoEstate.ai Video Editor Service Worker
  *
  * Handles offline functionality by caching application assets.
  * Implements a cache-first strategy for static assets and network-first for API calls.
@@ -10,9 +10,9 @@
  * - 35.4: Inform user that AI requires internet connectivity
  */
 
-const CACHE_NAME = "openreel-v1";
-const STATIC_CACHE_NAME = "openreel-static-v1";
-const DYNAMIC_CACHE_NAME = "openreel-dynamic-v1";
+const CACHE_NAME = "videoestate-video-editor-v1";
+const STATIC_CACHE_NAME = "videoestate-video-editor-static-v1";
+const DYNAMIC_CACHE_NAME = "videoestate-video-editor-dynamic-v1"; 
 
 /**
  * Static assets to cache on install

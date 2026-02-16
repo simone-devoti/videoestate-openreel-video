@@ -27,9 +27,9 @@ export default {
         primary: {
           DEFAULT: "hsl(var(--primary))",
           foreground: "hsl(var(--primary-foreground))",
-          hover: "#16a34a",
-          active: "#15803d",
-          glow: "rgba(34, 197, 94, 0.5)",
+          hover: "#0f45bd",
+          active: "#114dd1",
+          glow: "rgba(17, 77, 209, 0.5)",
         },
         secondary: {
           DEFAULT: "hsl(var(--secondary))",

@@ -19,7 +19,7 @@ export const TitleBar: React.FC = () => {
       {/* Center: App Name and File */}
       <div className="flex gap-2 items-center opacity-0 md:opacity-100">
         <span className="text-acid-green font-bold">OR</span>
-        <span className="text-reel-text-secondary">Open Reel Video</span>
+        <span className="text-reel-text-secondary">VideoEstate Video Editor</span>
         <span className="mx-2 text-reel-text-secondary">/</span>
         <span className="text-reel-text-primary">{activeFileName}</span>
       </div>

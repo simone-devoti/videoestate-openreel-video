@@ -25,7 +25,7 @@ export type ErrorSeverity = "info" | "warning" | "error" | "critical";
 
 type ErrorCallback = (error: AppError) => void;
 
-const ERROR_STORAGE_KEY = "openreel-error-log";
+const ERROR_STORAGE_KEY = "videoestate-video-editor-error-log";
 const MAX_STORED_ERRORS = 50;
 
 class ErrorHandler {
@@ -293,7 +293,7 @@ class ErrorHandler {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `openreel-error-report-${Date.now()}.json`;
+    a.download = `videoestate-video-editor-error-report-${Date.now()}.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

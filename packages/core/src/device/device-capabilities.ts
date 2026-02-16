@@ -60,7 +60,7 @@ export interface CodecRecommendation {
   qualityRating: "good" | "better" | "best";
 }
 
-const STORAGE_KEY = "openreel_device_profile";
+const STORAGE_KEY = "videoestate-video-editor-device_profile";
 
 function getCpuTier(cores: number): DeviceTier {
   if (cores >= 8) return "high";

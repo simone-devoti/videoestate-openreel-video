@@ -3,7 +3,7 @@ import { useProjectStore } from '../stores/project-store';
 import { useHistoryStore } from '../stores/history-store';
 
 const AUTO_SAVE_DELAY = 2000;
-const STORAGE_KEY_PREFIX = 'openreel-image-project-';
+const STORAGE_KEY_PREFIX = 'videoestate-video-editor-image-project-';
 
 export function useAutoSave() {
   const { project, isDirty, markClean } = useProjectStore();

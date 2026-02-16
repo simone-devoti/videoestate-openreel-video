@@ -112,7 +112,7 @@ export const useColorStore = create<ColorState & ColorActions>()(
       },
     }),
     {
-      name: 'openreel-image-colors',
+      name: 'videoestate-video-editor-image-colors',
     }
   )
 );
