@@ -88,7 +88,10 @@ function App() {
       }
 
       createNewProject(projectName, { width, height, frameRate });
-      navigate("editor");
+      navigate(
+        "editor",
+        params.mediaUrl ? { mediaUrl: params.mediaUrl } : undefined,
+      );
     } else if (route === "editor" && skipWelcomeScreen) {
       hasHandledInitialRoute.current = true;
     } else if (["welcome", "templates", "recent"].includes(route)) {
