@@ -214,7 +214,7 @@ const TRANSITIONS: TransitionDef[] = [
     renderPreview: (p, thumb) => (
       <>
         {renderThumb(thumb, { opacity: 1 - p }, "oklch(0.55 0.14 295)")}
-        {renderThumb(thumb, { opacity: p }, "oklch(0.72 0.16 162)")}
+        {renderThumb(thumb, { opacity: p }, "oklch(0.54 0.24 262)")}
       </>
     ),
   },
@@ -225,7 +225,7 @@ const TRANSITIONS: TransitionDef[] = [
     renderPreview: (p, thumb) => (
       <>
         {renderThumb(thumb, { opacity: p < 0.5 ? 1 - p * 2 : 0 }, "oklch(0.55 0.14 295)")}
-        {renderThumb(thumb, { opacity: p >= 0.5 ? (p - 0.5) * 2 : 0 }, "oklch(0.72 0.16 162)")}
+        {renderThumb(thumb, { opacity: p >= 0.5 ? (p - 0.5) * 2 : 0 }, "oklch(0.54 0.24 262)")}
         <div
           className="absolute inset-0 bg-black pointer-events-none"
           style={{ opacity: p < 0.5 ? p * 2 : (1 - p) * 2 }}
@@ -240,7 +240,7 @@ const TRANSITIONS: TransitionDef[] = [
     renderPreview: (p, thumb) => (
       <>
         {renderThumb(thumb, { opacity: p < 0.5 ? 1 - p * 2 : 0 }, "oklch(0.55 0.14 295)")}
-        {renderThumb(thumb, { opacity: p >= 0.5 ? (p - 0.5) * 2 : 0 }, "oklch(0.72 0.16 162)")}
+        {renderThumb(thumb, { opacity: p >= 0.5 ? (p - 0.5) * 2 : 0 }, "oklch(0.54 0.24 262)")}
         <div
           className="absolute inset-0 bg-white pointer-events-none"
           style={{ opacity: p < 0.5 ? p * 2 : (1 - p) * 2 }}
@@ -255,7 +255,7 @@ const TRANSITIONS: TransitionDef[] = [
     renderPreview: (p, thumb) => (
       <>
         {renderThumb(thumb, { clipPath: `inset(0 ${p * 100}% 0 0)` }, "oklch(0.55 0.14 295)")}
-        {renderThumb(thumb, { clipPath: `inset(0 0 0 ${(1 - p) * 100}%)` }, "oklch(0.72 0.16 162)")}
+        {renderThumb(thumb, { clipPath: `inset(0 0 0 ${(1 - p) * 100}%)` }, "oklch(0.54 0.24 262)")}
       </>
     ),
   },
@@ -266,7 +266,7 @@ const TRANSITIONS: TransitionDef[] = [
     renderPreview: (p, thumb) => (
       <>
         {renderThumb(thumb, { transform: `translateX(${-p * 100}%)` }, "oklch(0.55 0.14 295)")}
-        {renderThumb(thumb, { transform: `translateX(${(1 - p) * 100}%)` }, "oklch(0.72 0.16 162)")}
+        {renderThumb(thumb, { transform: `translateX(${(1 - p) * 100}%)` }, "oklch(0.54 0.24 262)")}
       </>
     ),
   },
@@ -277,7 +277,7 @@ const TRANSITIONS: TransitionDef[] = [
     renderPreview: (p, thumb) => (
       <>
         {renderThumb(thumb, { transform: `translateX(${-p * 100}%)` }, "oklch(0.55 0.14 295)")}
-        {renderThumb(thumb, { transform: `translateX(${(1 - p) * 100}%)` }, "oklch(0.72 0.16 162)")}
+        {renderThumb(thumb, { transform: `translateX(${(1 - p) * 100}%)` }, "oklch(0.54 0.24 262)")}
       </>
     ),
   },
@@ -295,7 +295,7 @@ const TRANSITIONS: TransitionDef[] = [
         {renderThumb(
           thumb,
           { transform: `scale(${1.5 - p * 0.5})`, opacity: p },
-          "oklch(0.72 0.16 162)",
+          "oklch(0.54 0.24 262)",
         )}
       </>
     ),
@@ -378,7 +378,7 @@ const EffectCard: React.FC<{
             className="absolute inset-0"
             style={{
               background:
-                "linear-gradient(135deg, oklch(0.55 0.14 295), oklch(0.72 0.16 162))",
+                "linear-gradient(135deg, oklch(0.55 0.14 295), oklch(0.54 0.24 262))",
               ...previewStyle,
             }}
           />
