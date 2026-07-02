@@ -174,6 +174,37 @@ export class SpeedEngine {
     }
   }
 
+  /**
+   * Move an existing speed keyframe to a new time and/or speed in-place,
+   * preserving its id and easing. Used by the curve editor when the
+   * user drags a keyframe.
+   */
+  updateSpeedKeyframe(
+    clipId: string,
+    keyframeId: string,
+    updates: { time?: number; speed?: number; easing?: EasingType },
+  ): void {
+    const data = this.clipSpeedData.get(clipId);
+    if (!data) return;
+    const idx = data.keyframes.findIndex((kf) => kf.id === keyframeId);
+    if (idx === -1) return;
+    const current = data.keyframes[idx];
+    const next: SpeedKeyframe = {
+      ...current,
+      time:
+        updates.time !== undefined
+          ? Math.max(0, Math.min(data.originalDuration, updates.time))
+          : current.time,
+      speed:
+        updates.speed !== undefined
+          ? this.clampSpeed(updates.speed)
+          : current.speed,
+      easing: updates.easing ?? current.easing,
+    };
+    data.keyframes[idx] = next;
+    data.keyframes.sort((a, b) => a.time - b.time);
+  }
+
   getSpeedKeyframes(clipId: string): SpeedKeyframe[] {
     const data = this.clipSpeedData.get(clipId);
     return data?.keyframes ?? [];
@@ -374,6 +405,33 @@ export class SpeedEngine {
   isPitchCorrectionEnabled(clipId: string): boolean {
     const data = this.clipSpeedData.get(clipId);
     return data?.pitchCorrection ?? true;
+  }
+
+  getInterpolationInfo(
+    clipId: string,
+    playbackTime: number,
+    sourceFrameRate: number,
+  ): {
+    needsInterpolation: boolean;
+    frameBefore: number;
+    frameAfter: number;
+    t: number;
+  } {
+    const sourceTime = this.getSourceTimeAtPlaybackTime(clipId, playbackTime);
+    const frameDuration = 1 / sourceFrameRate;
+    const exactFrame = sourceTime / frameDuration;
+    const frameBeforeIndex = Math.floor(exactFrame);
+    const frameAfterIndex = frameBeforeIndex + 1;
+    const t = exactFrame - frameBeforeIndex;
+
+    const needsInterpolation = t > 0.01 && t < 0.99;
+
+    return {
+      needsInterpolation,
+      frameBefore: frameBeforeIndex * frameDuration,
+      frameAfter: frameAfterIndex * frameDuration,
+      t,
+    };
   }
   private getOrCreateSpeedData(
     clipId: string,

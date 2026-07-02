@@ -60,6 +60,8 @@ export interface KeyboardShortcuts {
 export interface UIState {
   selectedItems: SelectionItem[];
   lastSelectedItem: SelectionItem | null;
+  effectApplicationClipId: string | null;
+  effectApplicationLabel: string | null;
   snapSettings: SnapSettings;
   panels: Record<PanelId, PanelState>;
   shortcuts: KeyboardShortcuts;
@@ -68,6 +70,7 @@ export interface UIState {
   showThumbnails: boolean;
   showKeyframes: boolean;
   autoScroll: boolean;
+  timelineMaximized: boolean;
   activeModal: string | null;
   modalData: Record<string, unknown> | null;
   contextMenu: {
@@ -86,6 +89,7 @@ export interface UIState {
   motionPathMode: boolean;
   motionPathClipId: string | null;
   keyframeEditorOpen: boolean;
+  inspectorActiveTab: string;
   select: (item: SelectionItem, addToSelection?: boolean) => void;
   selectMultiple: (items: SelectionItem[]) => void;
   deselect: (itemId: string) => void;
@@ -112,6 +116,8 @@ export interface UIState {
   setShowThumbnails: (show: boolean) => void;
   setShowKeyframes: (show: boolean) => void;
   setAutoScroll: (enabled: boolean) => void;
+  setTimelineMaximized: (maximized: boolean) => void;
+  toggleTimelineMaximized: () => void;
   openModal: (modalId: string, data?: Record<string, unknown>) => void;
   closeModal: () => void;
   showContextMenu: (x: number, y: number, items: ContextMenuItem[]) => void;
@@ -127,6 +133,7 @@ export interface UIState {
   setMotionPathMode: (enabled: boolean, clipId?: string) => void;
   setKeyframeEditorOpen: (open: boolean) => void;
   toggleKeyframeEditor: () => void;
+  setInspectorActiveTab: (tabId: string) => void;
   exportState: {
     isExporting: boolean;
     progress: number;
@@ -137,6 +144,8 @@ export interface UIState {
     progress: number;
     phase: string;
   }) => void;
+  startEffectApplication: (clipId: string, label?: string) => void;
+  finishEffectApplication: () => void;
 }
 
 export interface ContextMenuItem {
@@ -172,7 +181,7 @@ const DEFAULT_SNAP_SETTINGS: SnapSettings = {
   snapToPlayhead: true,
   snapToMarkers: true,
   gridSize: 1, // 1 second
-  snapThreshold: 10, // 10 pixels
+  snapThreshold: 40,
 };
 
 const DEFAULT_PANELS: Record<PanelId, PanelState> = {
@@ -190,6 +199,8 @@ export const useUIStore = create<UIState>()(
       (set, get) => ({
         selectedItems: [],
         lastSelectedItem: null,
+        effectApplicationClipId: null,
+        effectApplicationLabel: null,
 
         snapSettings: DEFAULT_SNAP_SETTINGS,
 
@@ -202,6 +213,7 @@ export const useUIStore = create<UIState>()(
         showThumbnails: true,
         showKeyframes: true,
         autoScroll: true,
+        timelineMaximized: false,
 
         activeModal: null,
         modalData: null,
@@ -220,6 +232,8 @@ export const useUIStore = create<UIState>()(
 
         keyframeEditorOpen: false,
 
+        inspectorActiveTab: "transform",
+
         showWelcomeScreen: true,
         skipWelcomeScreen: false,
 
@@ -230,6 +244,20 @@ export const useUIStore = create<UIState>()(
         },
 
         setExportState: (state) => set({ exportState: state }),
+
+        startEffectApplication: (clipId: string, label?: string) => {
+          set({
+            effectApplicationClipId: clipId,
+            effectApplicationLabel: label ?? null,
+          });
+        },
+
+        finishEffectApplication: () => {
+          set({
+            effectApplicationClipId: null,
+            effectApplicationLabel: null,
+          });
+        },
 
         select: (item: SelectionItem, addToSelection = false) => {
           const { selectedItems } = get();
@@ -451,6 +479,14 @@ export const useUIStore = create<UIState>()(
           set({ autoScroll: enabled });
         },
 
+        setTimelineMaximized: (maximized: boolean) => {
+          set({ timelineMaximized: maximized });
+        },
+
+        toggleTimelineMaximized: () => {
+          set((state) => ({ timelineMaximized: !state.timelineMaximized }));
+        },
+
         openModal: (modalId: string, data?: Record<string, unknown>) => {
           set({
             activeModal: modalId,
@@ -519,6 +555,10 @@ export const useUIStore = create<UIState>()(
           set((state) => ({ keyframeEditorOpen: !state.keyframeEditorOpen }));
         },
 
+        setInspectorActiveTab: (tabId: string) => {
+          set({ inspectorActiveTab: tabId });
+        },
+
         setShowWelcomeScreen: (show: boolean) => {
           set({ showWelcomeScreen: show });
         },
@@ -532,8 +572,14 @@ export const useUIStore = create<UIState>()(
       }),
       {
         name: "videoestate-video-editor-ui-preferences",
-        // Only persist user preferences, not transient state (selections, drag state, modals)
-        // This prevents localStorage bloat and ensures clean state on new sessions
+        version: 1,
+        migrate: (persisted: unknown, version: number) => {
+          const state = persisted as Record<string, unknown>;
+          if (version === 0) {
+            state.snapSettings = DEFAULT_SNAP_SETTINGS;
+          }
+          return state;
+        },
         partialize: (state) => ({
           snapSettings: state.snapSettings,
           panels: state.panels,
@@ -543,8 +589,9 @@ export const useUIStore = create<UIState>()(
           showThumbnails: state.showThumbnails,
           showKeyframes: state.showKeyframes,
           autoScroll: state.autoScroll,
+          timelineMaximized: state.timelineMaximized,
           skipWelcomeScreen: state.skipWelcomeScreen,
-          // NOT persisted: selectedItems, isDragging, contextMenu, activeModal, showWelcomeScreen
+          inspectorActiveTab: state.inspectorActiveTab,
         }),
       },
     ),

@@ -17,13 +17,14 @@ import {
   Minimize2,
   Move,
   Loader2,
+  ZoomIn,
 } from "lucide-react";
-import { IconButton } from "@openreel/ui";
 import { useProjectStore } from "../../stores/project-store";
 import { useTimelineStore } from "../../stores/timeline-store";
 import { useUIStore } from "../../stores/ui-store";
 import { useThemeStore } from "../../stores/theme-store";
 import { getRenderBridge } from "../../bridges/render-bridge";
+import { getEffectsBridge } from "../../bridges/effects-bridge";
 import {
   RendererFactory,
   type Renderer,
@@ -31,8 +32,14 @@ import {
   getSpeedEngine,
   getMasterClock,
   getRealtimeAudioGraph,
+  initializeAudioEffectsEngine,
+  getPreviewAudioEffects,
+  splitProfileAwareNoiseReductionEffects,
+  resolveClipAudioEffects as resolveTimelineClipAudioEffects,
+  resolveClipVolumeAutomation,
   getParticleEngine,
   type Effect,
+  type AudioEffectParams,
   type AudioClipSchedule,
   type TextClip,
   type ShapeClip,
@@ -57,7 +64,9 @@ import {
   drawFrameWithTransform,
   applyEffectsToFrame,
   getTransitionAtTime,
+  setImageLoadCallback,
   renderTransitionFrame,
+  renderTransitionCanvas,
   getAnimatedTransform,
   applyEmphasisAnimation,
   CropModeView,
@@ -65,27 +74,173 @@ import {
   ParticleRenderer,
 } from "./preview/index";
 import { ProcessingOverlay } from "./ProcessingOverlay";
+import {
+  getPersonSegmentationEngine,
+  getBackgroundRemovalEngine,
+  getStabilizedTransform,
+  getVidstabEngine,
+} from "@openreel/core";
 import type { MotionPathConfig, GSAPMotionPathPoint } from "@openreel/core";
-
-const getAdaptivePoolSize = (width: number, height: number): number => {
-  const pixels = width * height;
-  if (pixels >= 3840 * 2160) return 6;
-  if (pixels >= 2560 * 1440) return 5;
-  if (pixels >= 1920 * 1080) return 4;
-  return 3;
-};
 
 interface GPULayer {
   bitmap: ImageBitmap;
   transform: ClipTransform;
 }
 
+interface PreparedPreviewFrame {
+  frame: ImageBitmap | HTMLCanvasElement | OffscreenCanvas;
+  cleanup: () => void;
+}
+
+type PreviewClip = Track["clips"][number];
+
+const clipNeedsFrameProcessing = (clipId: string): boolean => {
+  const bgEngine = getBackgroundRemovalEngine();
+  if (bgEngine?.isInitialized() && bgEngine.getSettings(clipId).enabled) {
+    return true;
+  }
+
+  const effectsBridge = getEffectsBridge();
+  if (!effectsBridge.isInitialized()) {
+    return false;
+  }
+
+  if (effectsBridge.getEffects(clipId).some((effect) => effect.enabled)) {
+    return true;
+  }
+
+  return Object.keys(effectsBridge.getColorGrading(clipId)).length > 0;
+};
+
+const preparePreviewFrame = async (
+  clipId: string,
+  frameCanvas: HTMLCanvasElement | OffscreenCanvas,
+  preferBitmap: boolean,
+): Promise<PreparedPreviewFrame> => {
+  const needsProcessing = clipNeedsFrameProcessing(clipId);
+  if (!preferBitmap && !needsProcessing) {
+    return {
+      frame: frameCanvas,
+      cleanup: () => {},
+    };
+  }
+
+  let frameBitmap: ImageBitmap | null = null;
+  let processedFrame: ImageBitmap | null = null;
+
+  try {
+    frameBitmap = await createImageBitmap(frameCanvas);
+
+    if (!needsProcessing) {
+      return {
+        frame: frameBitmap,
+        cleanup: () => {
+          frameBitmap?.close();
+        },
+      };
+    }
+
+    processedFrame = await applyEffectsToFrame(clipId, frameBitmap);
+    if (processedFrame === frameBitmap) {
+      return {
+        frame: frameBitmap,
+        cleanup: () => {
+          frameBitmap?.close();
+        },
+      };
+    }
+
+    return {
+      frame: processedFrame,
+      cleanup: () => {
+        processedFrame?.close();
+        frameBitmap?.close();
+      },
+    };
+  } catch {
+    processedFrame?.close();
+    frameBitmap?.close();
+
+    return {
+      frame: frameCanvas,
+      cleanup: () => {},
+    };
+  }
+};
+
+const applyStabilizationTransform = (
+  clip: Track["clips"][number],
+  transform: ClipTransform,
+  sourceTime: number,
+  canvasWidth: number,
+  canvasHeight: number,
+  frameWidth: number,
+  frameHeight: number,
+): ClipTransform => {
+  return getStabilizedTransform(
+    clip,
+    transform,
+    sourceTime,
+    {
+      canvasWidth,
+      canvasHeight,
+      sourceWidth: frameWidth,
+      sourceHeight: frameHeight,
+    },
+  ) as ClipTransform;
+};
+
+// The WebGPU renderer maps a layer's texture onto a full-canvas quad, so a
+// scale of {1,1} stretches the source to the canvas. Bake the aspect-fit
+// ratio into the layer scale so GPU compositing letterboxes ("contain") like
+// the Canvas2D path instead of distorting mismatched-aspect clips.
+const computeFitScale = (
+  fitMode: ClipTransform["fitMode"],
+  sourceWidth: number,
+  sourceHeight: number,
+  canvasWidth: number,
+  canvasHeight: number,
+): { x: number; y: number } => {
+  const mode = !fitMode || fitMode === "none" ? "contain" : fitMode;
+  if (
+    mode === "stretch" ||
+    sourceWidth <= 0 ||
+    sourceHeight <= 0 ||
+    canvasWidth <= 0 ||
+    canvasHeight <= 0
+  ) {
+    return { x: 1, y: 1 };
+  }
+  const sourceAspect = sourceWidth / sourceHeight;
+  const canvasAspect = canvasWidth / canvasHeight;
+  let drawWidth: number;
+  let drawHeight: number;
+  if (mode === "cover") {
+    if (sourceAspect > canvasAspect) {
+      drawHeight = canvasHeight;
+      drawWidth = canvasHeight * sourceAspect;
+    } else {
+      drawWidth = canvasWidth;
+      drawHeight = canvasWidth / sourceAspect;
+    }
+  } else {
+    if (sourceAspect > canvasAspect) {
+      drawWidth = canvasWidth;
+      drawHeight = canvasWidth / sourceAspect;
+    } else {
+      drawHeight = canvasHeight;
+      drawWidth = canvasHeight * sourceAspect;
+    }
+  }
+  return { x: drawWidth / canvasWidth, y: drawHeight / canvasHeight };
+};
+
 const renderFrameWithGPU = async (
   renderer: Renderer,
   frame: ImageBitmap,
   transform: ClipTransform,
-  _canvasWidth: number,
-  _canvasHeight: number,
+  canvasWidth: number,
+  canvasHeight: number,
 ): Promise<ImageBitmap | null> => {
   try {
     const device = renderer.getDevice();
@@ -97,9 +252,19 @@ const renderFrameWithGPU = async (
 
     const texture = renderer.createTextureFromImage(frame);
 
+    const fitScale = computeFitScale(
+      transform.fitMode,
+      frame.width,
+      frame.height,
+      canvasWidth,
+      canvasHeight,
+    );
     const gpuTransform = {
       position: transform.position,
-      scale: transform.scale,
+      scale: {
+        x: transform.scale.x * fitScale.x,
+        y: transform.scale.y * fitScale.y,
+      },
       rotation: transform.rotation,
       anchor: transform.anchor,
       opacity: transform.opacity,
@@ -126,8 +291,8 @@ const renderFrameWithGPU = async (
 const renderAllLayersWithGPU = async (
   renderer: Renderer,
   layers: GPULayer[],
-  _canvasWidth: number,
-  _canvasHeight: number,
+  canvasWidth: number,
+  canvasHeight: number,
 ): Promise<ImageBitmap | null> => {
   try {
     const device = renderer.getDevice();
@@ -146,9 +311,19 @@ const renderAllLayersWithGPU = async (
       const texture = renderer.createTextureFromImage(layer.bitmap);
       textures.push(texture);
 
+      const fitScale = computeFitScale(
+        layer.transform.fitMode,
+        layer.bitmap.width,
+        layer.bitmap.height,
+        canvasWidth,
+        canvasHeight,
+      );
       const gpuTransform = {
         position: layer.transform.position,
-        scale: layer.transform.scale,
+        scale: {
+          x: layer.transform.scale.x * fitScale.x,
+          y: layer.transform.scale.y * fitScale.y,
+        },
         rotation: layer.transform.rotation,
         anchor: layer.transform.anchor,
         opacity: layer.transform.opacity,
@@ -177,6 +352,82 @@ const renderAllLayersWithGPU = async (
   }
 };
 
+const hasBehindSubjectText = (textClips: TextClip[]): boolean =>
+  textClips.some((textClip) => textClip.behindSubject);
+
+const captureSubjectFrame = async (
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+): Promise<ImageBitmap | null> => {
+  try {
+    return await createImageBitmap(
+      ctx.canvas as HTMLCanvasElement | OffscreenCanvas,
+      0,
+      0,
+      width,
+      height,
+    );
+  } catch {
+    return null;
+  }
+};
+
+const drawMaskedSubjectFromFrame = async (
+  ctx: CanvasRenderingContext2D,
+  subjectFrame: ImageBitmap | null,
+  canvasWidth: number,
+  canvasHeight: number,
+): Promise<void> => {
+  if (!subjectFrame) return;
+
+  const segEngine = getPersonSegmentationEngine();
+  if (!segEngine.isInitialized()) return;
+
+  try {
+    const maskResult = await segEngine.getPersonMask(subjectFrame);
+    if (!maskResult) return;
+
+    const personCanvas = new OffscreenCanvas(canvasWidth, canvasHeight);
+    const personCtx = personCanvas.getContext("2d");
+    if (!personCtx) return;
+
+    personCtx.drawImage(subjectFrame, 0, 0, canvasWidth, canvasHeight);
+
+    const maskCanvas = new OffscreenCanvas(maskResult.width, maskResult.height);
+    const maskCtx = maskCanvas.getContext("2d");
+    if (!maskCtx) return;
+
+    maskCtx.putImageData(maskResult.mask, 0, 0);
+    personCtx.globalCompositeOperation = "destination-in";
+    personCtx.drawImage(maskCanvas, 0, 0, canvasWidth, canvasHeight);
+
+    ctx.drawImage(personCanvas, 0, 0);
+  } catch {
+    // If segmentation fails for a frame, keep the normal text overlay visible.
+  }
+};
+
+const renderTextClipWithSubjectMask = async (
+  ctx: CanvasRenderingContext2D,
+  textClip: TextClip,
+  canvasWidth: number,
+  canvasHeight: number,
+  time: number,
+  subjectFrame: ImageBitmap | null,
+): Promise<void> => {
+  renderTextClipToCanvas(ctx, textClip, canvasWidth, canvasHeight, time);
+
+  if (textClip.behindSubject) {
+    await drawMaskedSubjectFromFrame(
+      ctx,
+      subjectFrame,
+      canvasWidth,
+      canvasHeight,
+    );
+  }
+};
+
 interface ClipWithPlaceholder {
   isPlaceholder?: boolean;
 }
@@ -184,11 +435,21 @@ interface ClipWithPlaceholder {
 export const Preview: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const videoAreaRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const animationRef = useRef<number | null>(null);
   const renderBridgeInitialized = useRef<boolean>(false);
   const lastGoodFrameRef = useRef<ImageBitmap | null>(null);
   const offscreenCanvasRef = useRef<OffscreenCanvas | null>(null);
+  const decodeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const decodeDebounceResolveRef = useRef<((value: ImageBitmap | null) => void) | null>(
+    null,
+  );
+  const decodeRequestSeqRef = useRef(0);
+  const scrubVideoReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const lastPreviewRenderTimeRef = useRef(0);
   const offscreenCtxRef = useRef<OffscreenCanvasRenderingContext2D | null>(
     null,
   );
@@ -205,6 +466,104 @@ export const Preview: React.FC = () => {
     null,
   );
   const audioBufferCacheRef = useRef<Map<string, AudioBuffer>>(new Map());
+  const processedAudioBufferCacheRef = useRef<Map<string, AudioBuffer>>(new Map());
+
+  const getAudioBufferCacheKey = (mediaId: string, audioTrackIndex?: number): string =>
+    `${mediaId}:${audioTrackIndex ?? 0}`;
+
+  const loadAudioBuffer = async (
+    audioContext: AudioContext | BaseAudioContext,
+    blob: Blob,
+    audioTrackIndex: number = 0,
+  ): Promise<AudioBuffer | null> => {
+    try {
+      const { getFFmpegFallback } = await import("@openreel/core/media");
+      const ffmpeg = getFFmpegFallback();
+      const wavBlob = await ffmpeg.extractAudioAsWav(blob, audioTrackIndex);
+      const arrayBuffer = await wavBlob.arrayBuffer();
+      return await audioContext.decodeAudioData(arrayBuffer);
+    } catch {
+      // ffmpeg extraction failed — fall back to browser decode for primary track
+    }
+
+    if (audioTrackIndex === 0) {
+      try {
+        const arrayBuffer = await blob.arrayBuffer();
+        return await audioContext.decodeAudioData(arrayBuffer);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const getAudioEffectSignature = useCallback((effects: Effect[]): string =>
+    JSON.stringify(
+      effects.map((effect) => ({
+        id: effect.id,
+        type: effect.type,
+        enabled: effect.enabled,
+        params: effect.params,
+        metadata: effect.metadata,
+      })),
+    ), []);
+
+  const getPreviewAudioBufferForEffects = useCallback(
+    async (
+      audioBuffer: AudioBuffer,
+      baseCacheKey: string,
+      effects: Effect[],
+    ): Promise<{ audioBuffer: AudioBuffer; effects: Effect[] }> => {
+      const previewEffects = getPreviewAudioEffects(
+        effects.filter((effect) => effect.enabled),
+      );
+      const { profileAwareNoiseEffects, realtimeEffects } =
+        splitProfileAwareNoiseReductionEffects(previewEffects);
+
+      if (profileAwareNoiseEffects.length === 0) {
+        return { audioBuffer, effects: realtimeEffects };
+      }
+
+      const processedCacheKey = `${baseCacheKey}:profile-denoise:${getAudioEffectSignature(profileAwareNoiseEffects)}`;
+      const cached = processedAudioBufferCacheRef.current.get(processedCacheKey);
+      if (cached) {
+        return { audioBuffer: cached, effects: realtimeEffects };
+      }
+
+      const effectsEngine = await initializeAudioEffectsEngine();
+      let processedBuffer = audioBuffer;
+
+      for (const effect of profileAwareNoiseEffects) {
+        const params = effect.params as AudioEffectParams["noiseReduction"];
+        if (!params.profile) {
+          continue;
+        }
+
+        processedBuffer = await effectsEngine.applyNoiseReductionWithProfileData(
+          processedBuffer,
+          params.profile,
+          params.reduction ?? 0.5,
+          params.focus ?? "balanced",
+          params.threshold ?? -40,
+        );
+      }
+
+      processedAudioBufferCacheRef.current.set(processedCacheKey, processedBuffer);
+      return { audioBuffer: processedBuffer, effects: realtimeEffects };
+    },
+    [getAudioEffectSignature],
+  );
+
+  const getResolvedClipAudioEffects = useCallback((clip: PreviewClip): Effect[] => {
+    return resolveTimelineClipAudioEffects(clip, {
+      tracks: timelineTracksRef.current,
+    });
+  }, []);
+
+  const getResolvedClipVolumeAutomation = useCallback((clip: PreviewClip) =>
+    resolveClipVolumeAutomation(clip, {
+      tracks: timelineTracksRef.current,
+    }), []);
 
   const rendererRef = useRef<Renderer | null>(null);
   const rendererInitializedRef = useRef<boolean>(false);
@@ -212,11 +571,40 @@ export const Preview: React.FC = () => {
   const [isMuted, setIsMuted] = useState(false);
   const [isRenderBridgeReady, setIsRenderBridgeReady] = useState(false);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
+  const [videoAreaSize, setVideoAreaSize] = useState({ width: 0, height: 0 });
   const [rendererType, setRendererType] = useState<string>("none");
   const [isMaximized, setIsMaximized] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [zoomLevel, setZoomLevel] = useState(1);
+  const [showZoomMenu, setShowZoomMenu] = useState(false);
+
+  const ZOOM_OPTIONS = [
+    { label: "50%", value: 0.5 },
+    { label: "75%", value: 0.75 },
+    { label: "100%", value: 1 },
+    { label: "125%", value: 1.25 },
+    { label: "150%", value: 1.5 },
+    { label: "200%", value: 2 },
+  ];
 
   const isDark = useThemeStore((state) => state.isDark);
+
+  // The preview canvas background / letterbox bars follow the theme (matching
+  // the --stage-bg token) instead of being hardcoded black, so light mode
+  // shows a light stage. Kept in a ref so every render path (scrub, playback,
+  // transitions) picks up the current value without re-creating callbacks.
+  // Export keeps a black backdrop separately (video-engine), so exported video
+  // is never letterboxed in the UI theme color.
+  const previewBgRef = useRef<string>(isDark ? "#000000" : "#ffffff");
+  useEffect(() => {
+    const screenBg =
+      typeof window !== "undefined"
+        ? getComputedStyle(document.documentElement)
+            .getPropertyValue("--screen-bg")
+            .trim()
+        : "";
+    previewBgRef.current = screenBg || (isDark ? "#000000" : "#ffffff");
+  }, [isDark]);
 
   // Canvas interaction state for resize/move
   const [interactionMode, setInteractionMode] =
@@ -263,6 +651,69 @@ export const Preview: React.FC = () => {
     Map<string, { video: HTMLVideoElement; url: string; lastUsed: number }>
   >(new Map());
 
+  const releaseVideoElement = useCallback(
+    (entry: { video: HTMLVideoElement; url: string }): void => {
+      const { video, url } = entry;
+      video.pause();
+      video.removeAttribute("src");
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      video.load();
+      URL.revokeObjectURL(url);
+    },
+    [],
+  );
+
+  const evictOldestVideoElement = useCallback((): void => {
+    let oldestKey = "";
+    let oldestTime = Infinity;
+    for (const [key, entry] of videoElementCacheRef.current.entries()) {
+      if (entry.lastUsed < oldestTime) {
+        oldestTime = entry.lastUsed;
+        oldestKey = key;
+      }
+    }
+
+    if (!oldestKey) return;
+
+    const oldEntry = videoElementCacheRef.current.get(oldestKey);
+    if (!oldEntry) return;
+
+    releaseVideoElement(oldEntry);
+    videoElementCacheRef.current.delete(oldestKey);
+  }, [releaseVideoElement]);
+
+  const cancelPendingScrubDecode = useCallback((): void => {
+    if (decodeDebounceRef.current) {
+      clearTimeout(decodeDebounceRef.current);
+      decodeDebounceRef.current = null;
+    }
+    decodeDebounceResolveRef.current?.(null);
+    decodeDebounceResolveRef.current = null;
+    decodeRequestSeqRef.current += 1;
+  }, []);
+
+  const releaseScrubVideoElements = useCallback((): void => {
+    if (scrubVideoReleaseTimerRef.current) {
+      clearTimeout(scrubVideoReleaseTimerRef.current);
+      scrubVideoReleaseTimerRef.current = null;
+    }
+    cancelPendingScrubDecode();
+    for (const entry of videoElementCacheRef.current.values()) {
+      releaseVideoElement(entry);
+    }
+    videoElementCacheRef.current.clear();
+  }, [cancelPendingScrubDecode, releaseVideoElement]);
+
+  const scheduleScrubVideoRelease = useCallback((): void => {
+    if (scrubVideoReleaseTimerRef.current) {
+      clearTimeout(scrubVideoReleaseTimerRef.current);
+    }
+    scrubVideoReleaseTimerRef.current = setTimeout(() => {
+      releaseScrubVideoElements();
+    }, 350);
+  }, [releaseScrubVideoElements]);
+
   // Persistent decoder cache for efficient playback (legacy - kept for fallback)
   const decoderCacheRef = useRef<
     Map<
@@ -293,6 +744,21 @@ export const Preview: React.FC = () => {
     });
 
     resizeObserver.observe(canvas);
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const videoArea = videoAreaRef.current;
+    if (!videoArea) return;
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        setVideoAreaSize({ width, height });
+      }
+    });
+
+    resizeObserver.observe(videoArea);
     return () => resizeObserver.disconnect();
   }, []);
 
@@ -334,6 +800,36 @@ export const Preview: React.FC = () => {
   const timelineTracks = project.timeline.tracks;
   const settings = project.settings;
 
+  const previewFrameSize = useMemo(() => {
+    if (videoAreaSize.width <= 0 || videoAreaSize.height <= 0) {
+      return { width: 0, height: 0 };
+    }
+
+    const aspectRatio = settings.width / settings.height;
+    // Fill the available preview area (minus a small margin) while preserving
+    // the project aspect ratio, instead of capping at a fixed small size which
+    // left the monitor floating in unused space on larger screens.
+    const PREVIEW_PADDING = 24;
+    const availableWidth = Math.max(1, videoAreaSize.width - PREVIEW_PADDING * 2);
+    const availableHeight = Math.max(
+      1,
+      videoAreaSize.height - PREVIEW_PADDING * 2,
+    );
+
+    let width = availableWidth;
+    let height = width / aspectRatio;
+
+    if (height > availableHeight) {
+      height = availableHeight;
+      width = height * aspectRatio;
+    }
+
+    return {
+      width: width * zoomLevel,
+      height: height * zoomLevel,
+    };
+  }, [settings.height, settings.width, videoAreaSize, zoomLevel]);
+
   // Keep a ref to timelineTracks for use in playback effect without causing re-runs
   const timelineTracksRef = useRef(timelineTracks);
   useEffect(() => {
@@ -367,10 +863,12 @@ export const Preview: React.FC = () => {
   const exportState = useUIStore((state) => state.exportState);
   const motionPathMode = useUIStore((state) => state.motionPathMode);
   const motionPathClipId = useUIStore((state) => state.motionPathClipId);
+  const select = useUIStore((state) => state.select);
 
   const {
     playheadPosition,
     playbackState,
+    playbackLockedReason,
     playbackRate,
     isScrubbing,
     pause,
@@ -522,15 +1020,12 @@ export const Preview: React.FC = () => {
       }
       decoderCacheRef.current.clear();
 
-      for (const entry of videoElementCacheRef.current.values()) {
-        entry.video.src = "";
-        URL.revokeObjectURL(entry.url);
-      }
-      videoElementCacheRef.current.clear();
+      releaseScrubVideoElements();
 
       if (videoElementRef.current) {
         videoElementRef.current.pause();
-        videoElementRef.current.src = "";
+        videoElementRef.current.removeAttribute("src");
+        videoElementRef.current.load();
         videoElementRef.current = null;
       }
       if (videoUrlRef.current) {
@@ -539,7 +1034,7 @@ export const Preview: React.FC = () => {
       }
       currentVideoMediaIdRef.current = null;
     };
-  }, []);
+  }, [releaseScrubVideoElements]);
 
   // Set canvas internal resolution ONLY when project settings change
   // This follows the WebGPU best practice of keeping internal resolution fixed
@@ -692,7 +1187,7 @@ export const Preview: React.FC = () => {
       gainNodeRef.current.gain.value = isMuted ? 0 : 1;
     }
     if (audioGraphRef.current) {
-      audioGraphRef.current.setMasterVolume(isMuted ? 0 : 1);
+      audioGraphRef.current.setPreviewMuted(isMuted);
     }
   }, [isMuted]);
 
@@ -705,7 +1200,7 @@ export const Preview: React.FC = () => {
    * "all" renders all overlays (legacy behavior for when no video is present)
    */
   const renderOverlayClipsInTrackOrder = useCallback(
-    (
+    async (
       ctx: CanvasRenderingContext2D,
       tracks: Track[],
       shapeClips: (ShapeClip | SVGClip | StickerClip)[],
@@ -714,6 +1209,7 @@ export const Preview: React.FC = () => {
       canvasWidth: number,
       canvasHeight: number,
       mode: "below-video" | "above-video" | "all" = "all",
+      subjectFrame: ImageBitmap | null = null,
     ) => {
       const videoImageTrackIndices = tracks
         .map((t, idx) => ({ track: t, originalIndex: idx }))
@@ -772,12 +1268,13 @@ export const Preview: React.FC = () => {
             (tc) => tc.trackId === track.id,
           );
           for (const textClip of trackTextClips) {
-            renderTextClipToCanvas(
+            await renderTextClipWithSubjectMask(
               ctx,
               textClip,
               canvasWidth,
               canvasHeight,
               time,
+              subjectFrame,
             );
           }
         }
@@ -800,17 +1297,13 @@ export const Preview: React.FC = () => {
     async (timelinePosition: number): Promise<void> => {
       const tracks = timelineTracksRef.current;
       const audioTracks = tracks.filter((t) => t.type === "audio" && !t.hidden);
-      const videoTracks = tracks.filter(
-        (t) => (t.type === "video" || t.type === "image") && !t.hidden,
-      );
 
       if (!audioGraphRef.current) {
         audioGraphRef.current = getRealtimeAudioGraph();
       }
       const audioGraph = audioGraphRef.current;
-      audioGraph.setMasterVolume(isMuted ? 0 : 1);
+      audioGraph.setPreviewMuted(isMuted);
 
-      const projectStore = useProjectStore.getState();
       const speedEngine = getSpeedEngine();
       const scheduledClips: AudioClipSchedule[] = [];
 
@@ -840,15 +1333,24 @@ export const Preview: React.FC = () => {
               continue;
             }
 
-            let audioBuffer = audioBufferCacheRef.current.get(
+            const audioCacheKey = getAudioBufferCacheKey(
               audioClip.mediaId,
+              audioClip.audioTrackIndex,
             );
+            let audioBuffer = audioBufferCacheRef.current.get(audioCacheKey);
             if (!audioBuffer) {
               try {
                 const audioContext = audioGraph.getAudioContext();
-                const arrayBuffer = await mediaItem.blob.arrayBuffer();
-                audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-                audioBufferCacheRef.current.set(audioClip.mediaId, audioBuffer);
+                const loaded = await loadAudioBuffer(
+                  audioContext,
+                  mediaItem.blob,
+                  audioClip.audioTrackIndex ?? 0,
+                );
+                if (!loaded) {
+                  continue;
+                }
+                audioBuffer = loaded;
+                audioBufferCacheRef.current.set(audioCacheKey, audioBuffer);
               } catch (error) {
                 console.warn(
                   `[Preview] Failed to decode audio for clip ${audioClip.id}:`,
@@ -858,33 +1360,18 @@ export const Preview: React.FC = () => {
               }
             }
 
-            const audioClipData = projectStore.getClip(audioClip.id);
-            let audioEffects = audioClipData?.audioEffects || [];
-
-            if (audioEffects.length === 0) {
-              for (const videoTrack of videoTracks) {
-                for (const videoClip of videoTrack.clips) {
-                  if (
-                    videoClip.mediaId === audioClip.mediaId &&
-                    Math.abs(videoClip.startTime - audioClip.startTime) < 0.01
-                  ) {
-                    const videoClipData = projectStore.getClip(videoClip.id);
-                    const linkedEffects = videoClipData?.audioEffects || [];
-                    if (linkedEffects.length > 0) {
-                      audioEffects = linkedEffects;
-                      break;
-                    }
-                  }
-                }
-                if (audioEffects.length > 0) break;
-              }
-            }
+            const audioEffects = getResolvedClipAudioEffects(audioClip);
 
             const enabledEffects = audioEffects.filter(
               (e: Effect) => e.enabled,
             );
+            const previewAudio = await getPreviewAudioBufferForEffects(
+              audioBuffer,
+              audioCacheKey,
+              enabledEffects,
+            );
 
-            audioGraph.updateTrackEffects(audioTrack.id, enabledEffects);
+            audioGraph.updateTrackEffects(audioTrack.id, previewAudio.effects);
 
             const clipLocalTime = timelinePosition - audioClip.startTime;
             const isReverse = speedEngine.isReverse(audioClip.id);
@@ -898,13 +1385,14 @@ export const Preview: React.FC = () => {
             scheduledClips.push({
               clipId: audioClip.id,
               trackId: audioTrack.id,
-              audioBuffer,
+              audioBuffer: previewAudio.audioBuffer,
               startTime: audioClip.startTime,
               endTime: clipEnd,
               mediaOffset,
               volume: audioClip.volume ?? 1,
+              volumeAutomation: getResolvedClipVolumeAutomation(audioClip),
               pan: 0,
-              effects: enabledEffects,
+              effects: previewAudio.effects,
               speed: audioClip.speed ?? 1,
             });
           }
@@ -916,7 +1404,13 @@ export const Preview: React.FC = () => {
         audioGraph.scheduleClips(scheduledClips);
       }
     },
-    [getMediaItem, isMuted],
+    [
+      getMediaItem,
+      getPreviewAudioBufferForEffects,
+      getResolvedClipAudioEffects,
+      getResolvedClipVolumeAutomation,
+      isMuted,
+    ],
   );
 
   const preDecodeAllAudioBuffers = useCallback(async (): Promise<void> => {
@@ -936,24 +1430,48 @@ export const Preview: React.FC = () => {
 
     for (const track of allTracks) {
       for (const clip of track.clips) {
-        if (audioBufferCacheRef.current.has(clip.mediaId)) {
-          continue;
+        const cacheKey = getAudioBufferCacheKey(clip.mediaId, clip.audioTrackIndex);
+        let audioBuffer: AudioBuffer | null | undefined =
+          audioBufferCacheRef.current.get(cacheKey);
+
+        if (!audioBuffer) {
+          const mediaItem = getMediaItem(clip.mediaId);
+          if (!mediaItem?.blob) {
+            continue;
+          }
+
+          try {
+            audioBuffer = await loadAudioBuffer(
+              audioContext,
+              mediaItem.blob,
+              clip.audioTrackIndex ?? 0,
+            );
+            if (audioBuffer) {
+              audioBufferCacheRef.current.set(cacheKey, audioBuffer);
+            }
+          } catch {
+            audioBuffer = null;
+          }
         }
 
-        const mediaItem = getMediaItem(clip.mediaId);
-        if (!mediaItem?.blob) {
-          continue;
-        }
-
-        try {
-          const arrayBuffer = await mediaItem.blob.arrayBuffer();
-          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-          audioBufferCacheRef.current.set(clip.mediaId, audioBuffer);
-        } catch {
+        if (audioBuffer) {
+          const audioEffects = getResolvedClipAudioEffects(clip).filter(
+            (effect: Effect) => effect.enabled,
+          );
+          if (audioEffects.length > 0) {
+            try {
+              await getPreviewAudioBufferForEffects(audioBuffer, cacheKey, audioEffects);
+            } catch (error) {
+              console.warn(
+                `[Preview] Failed to pre-process audio effects for clip ${clip.id}:`,
+                error,
+              );
+            }
+          }
         }
       }
     }
-  }, [getMediaItem]);
+  }, [getMediaItem, getPreviewAudioBufferForEffects, getResolvedClipAudioEffects]);
 
   const getAudioClipsForScheduler = useCallback(
     (time: number): AudioClipSchedule[] => {
@@ -962,7 +1480,6 @@ export const Preview: React.FC = () => {
         (t) => (t.type === "audio" || t.type === "video") && !t.hidden && !t.muted,
       );
       const schedules: AudioClipSchedule[] = [];
-      const projectStore = useProjectStore.getState();
 
       for (const track of tracksWithAudio) {
         for (const clip of track.clips) {
@@ -971,26 +1488,47 @@ export const Preview: React.FC = () => {
             continue;
           }
 
-          const audioBuffer = audioBufferCacheRef.current.get(clip.mediaId);
+          const audioBuffer = audioBufferCacheRef.current.get(
+            getAudioBufferCacheKey(clip.mediaId, clip.audioTrackIndex),
+          );
           if (!audioBuffer) {
             continue;
           }
 
-          const clipData = projectStore.getClip(clip.id);
-          const audioEffects = (clipData?.audioEffects || []).filter(
+          const audioEffects = getResolvedClipAudioEffects(clip).filter(
             (e: Effect) => e.enabled,
           );
+          const previewEffects = getPreviewAudioEffects(audioEffects);
+          const { profileAwareNoiseEffects, realtimeEffects } =
+            splitProfileAwareNoiseReductionEffects(previewEffects);
+          let scheduleAudioBuffer = audioBuffer;
+          let scheduleEffects = previewEffects;
+
+          if (profileAwareNoiseEffects.length > 0) {
+            const processedCacheKey = `${getAudioBufferCacheKey(
+              clip.mediaId,
+              clip.audioTrackIndex,
+            )}:profile-denoise:${getAudioEffectSignature(profileAwareNoiseEffects)}`;
+            const processedAudioBuffer =
+              processedAudioBufferCacheRef.current.get(processedCacheKey);
+
+            if (processedAudioBuffer) {
+              scheduleAudioBuffer = processedAudioBuffer;
+              scheduleEffects = realtimeEffects;
+            }
+          }
 
           schedules.push({
             clipId: clip.id,
             trackId: track.id,
-            audioBuffer,
+            audioBuffer: scheduleAudioBuffer,
             startTime: clip.startTime,
             endTime: clipEnd,
             mediaOffset: clip.inPoint || 0,
             volume: clip.volume ?? 1,
+            volumeAutomation: getResolvedClipVolumeAutomation(clip),
             pan: 0,
-            effects: audioEffects,
+            effects: scheduleEffects,
             speed: clip.speed ?? 1,
           });
         }
@@ -998,7 +1536,11 @@ export const Preview: React.FC = () => {
 
       return schedules;
     },
-    [],
+    [
+      getAudioEffectSignature,
+      getResolvedClipAudioEffects,
+      getResolvedClipVolumeAutomation,
+    ],
   );
 
   /**
@@ -1019,6 +1561,10 @@ export const Preview: React.FC = () => {
     ): Promise<ImageBitmap | null> => {
       const mediaItem = getMediaItem(clip.mediaId);
       if (!mediaItem?.blob) return null;
+      const vidstab = getVidstabEngine();
+      const mediaBlob = (vidstab.hasStabilized(clip.id)
+        ? vidstab.getStabilizedBlob(clip.id)
+        : mediaItem.blob)!;
 
       if (mediaItem.type === "image") {
         try {
@@ -1028,121 +1574,226 @@ export const Preview: React.FC = () => {
         }
       }
 
-      try {
-        const clipLocalTime = time - clip.startTime;
-        const speedEngine = getSpeedEngine();
-        const adjustedLocalTime = speedEngine.getSourceTimeAtPlaybackTime(
-          clip.id,
-          clipLocalTime,
-        );
-        const mediaTime = (clip.inPoint || 0) + adjustedLocalTime;
+      const requestSeq = ++decodeRequestSeqRef.current;
+      const isStaleRequest = () => requestSeq !== decodeRequestSeqRef.current;
 
-        const cacheKey = clip.mediaId;
-        let cached = videoElementCacheRef.current.get(cacheKey);
-
-        if (!cached) {
-          const url = URL.createObjectURL(mediaItem.blob);
-          const video = document.createElement("video");
-          video.src = url;
-          video.muted = true;
-          video.playsInline = true;
-          video.preload = "auto";
-          video.crossOrigin = "anonymous";
-
-          await new Promise<void>((resolve, reject) => {
-            const timeoutId = setTimeout(
-              () => reject(new Error("Video load timeout")),
-              10000,
-            );
-            video.onloadedmetadata = () => {
-              clearTimeout(timeoutId);
-              resolve();
-            };
-            video.onerror = () => {
-              clearTimeout(timeoutId);
-              reject(new Error("Video load failed"));
-            };
-          });
-
-          cached = { video, url, lastUsed: Date.now() };
-          videoElementCacheRef.current.set(cacheKey, cached);
-
-          if (videoElementCacheRef.current.size > 8) {
-            let oldestKey = "";
-            let oldestTime = Infinity;
-            for (const [key, entry] of videoElementCacheRef.current.entries()) {
-              if (entry.lastUsed < oldestTime) {
-                oldestTime = entry.lastUsed;
-                oldestKey = key;
-              }
-            }
-            if (oldestKey) {
-              const oldEntry = videoElementCacheRef.current.get(oldestKey);
-              if (oldEntry) {
-                oldEntry.video.src = "";
-                URL.revokeObjectURL(oldEntry.url);
-                videoElementCacheRef.current.delete(oldestKey);
-              }
-            }
-          }
-        }
-
-        cached.lastUsed = Date.now();
-        const { video } = cached;
-
-        const clampedTime = Math.max(
-          0,
-          Math.min(mediaTime, video.duration - 0.001),
-        );
-        if (Math.abs(video.currentTime - clampedTime) > 0.01) {
-          video.currentTime = clampedTime;
-          await new Promise<void>((resolve) => {
-            const onSeeked = () => {
-              video.removeEventListener("seeked", onSeeked);
-              resolve();
-            };
-            video.addEventListener("seeked", onSeeked);
-            setTimeout(resolve, 500);
-          });
-        }
-
-        const tempCanvas = document.createElement("canvas");
-        tempCanvas.width = canvasWidth;
-        tempCanvas.height = canvasHeight;
-        const tempCtx = tempCanvas.getContext("2d");
-        if (!tempCtx) return null;
-
-        const videoAspect = video.videoWidth / video.videoHeight;
-        const canvasAspect = canvasWidth / canvasHeight;
-        let drawWidth = canvasWidth;
-        let drawHeight = canvasHeight;
-        let offsetX = 0;
-        let offsetY = 0;
-
-        if (videoAspect > canvasAspect) {
-          drawHeight = canvasWidth / videoAspect;
-          offsetY = (canvasHeight - drawHeight) / 2;
-        } else {
-          drawWidth = canvasHeight * videoAspect;
-          offsetX = (canvasWidth - drawWidth) / 2;
-        }
-
-        tempCtx.fillStyle = "#000000";
-        tempCtx.fillRect(0, 0, canvasWidth, canvasHeight);
-        tempCtx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
-
-        return await createImageBitmap(tempCanvas);
-      } catch {
-        const cached = videoElementCacheRef.current.get(clip.mediaId);
-        if (cached) {
-          cached.video.src = "";
-          URL.revokeObjectURL(cached.url);
-          videoElementCacheRef.current.delete(clip.mediaId);
-        }
-        return null;
+      if (scrubVideoReleaseTimerRef.current) {
+        clearTimeout(scrubVideoReleaseTimerRef.current);
+        scrubVideoReleaseTimerRef.current = null;
       }
+
+      if (decodeDebounceRef.current) {
+        clearTimeout(decodeDebounceRef.current);
+        decodeDebounceRef.current = null;
+      }
+      decodeDebounceResolveRef.current?.(null);
+      decodeDebounceResolveRef.current = null;
+
+      return new Promise<ImageBitmap | null>((resolve) => {
+        decodeDebounceResolveRef.current = resolve;
+        decodeDebounceRef.current = setTimeout(async () => {
+          decodeDebounceRef.current = null;
+          decodeDebounceResolveRef.current = null;
+
+          if (isStaleRequest()) {
+            resolve(null);
+            return;
+          }
+
+          try {
+            const clipLocalTime = time - clip.startTime;
+            const speedEngine = getSpeedEngine();
+            const adjustedLocalTime = speedEngine.getSourceTimeAtPlaybackTime(
+              clip.id,
+              clipLocalTime,
+            );
+            const isStabilized = vidstab.hasStabilized(clip.id);
+            const mediaTime = isStabilized ? adjustedLocalTime : (clip.inPoint || 0) + adjustedLocalTime;
+            const cacheKey = isStabilized ? `${clip.mediaId}:stabilized` : clip.mediaId;
+            let cached = videoElementCacheRef.current.get(cacheKey);
+
+            if (!cached) {
+              const url = URL.createObjectURL(mediaBlob);
+              const video = document.createElement("video");
+              video.src = url;
+              video.muted = true;
+              video.playsInline = true;
+              video.preload = "metadata";
+              video.crossOrigin = "anonymous";
+
+              await new Promise<void>((res, rej) => {
+                const timeoutId = setTimeout(
+                  () => rej(new Error("Video load timeout")),
+                  10000,
+                );
+                video.onloadedmetadata = () => {
+                  clearTimeout(timeoutId);
+                  res();
+                };
+                video.onerror = () => {
+                  clearTimeout(timeoutId);
+                  rej(new Error("Video load failed"));
+                };
+              });
+
+              if (isStaleRequest()) {
+                releaseVideoElement({ video, url });
+                resolve(null);
+                return;
+              }
+
+              cached = { video, url, lastUsed: Date.now() };
+              videoElementCacheRef.current.set(cacheKey, cached);
+
+              while (videoElementCacheRef.current.size > 2) {
+                evictOldestVideoElement();
+              }
+            }
+
+            cached.lastUsed = Date.now();
+            const { video } = cached;
+
+            const clampedTime = Math.max(
+              0,
+              Math.min(mediaTime, video.duration - 0.001),
+            );
+            const seekTime =
+              clampedTime <= 0 && video.duration > 0.002 ? 0.001 : clampedTime;
+            if (
+              Math.abs(video.currentTime - seekTime) > 0.01 ||
+              video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+            ) {
+              video.currentTime = seekTime;
+              await new Promise<void>((res) => {
+                let settled = false;
+                let timeoutId: ReturnType<typeof setTimeout> | null = null;
+                const onSeeked = () => {
+                  if (settled) return;
+                  settled = true;
+                  if (timeoutId) clearTimeout(timeoutId);
+                  video.removeEventListener("seeked", onSeeked);
+                  res();
+                };
+                video.addEventListener("seeked", onSeeked);
+                timeoutId = setTimeout(() => {
+                  if (settled) return;
+                  settled = true;
+                  video.removeEventListener("seeked", onSeeked);
+                  res();
+                }, 250);
+              });
+            }
+
+            if (isStaleRequest()) {
+              resolve(null);
+              return;
+            }
+
+            await new Promise<void>((res) => {
+              if (!("requestVideoFrameCallback" in video)) {
+                res();
+                return;
+              }
+
+              let settled = false;
+              let timeoutId: ReturnType<typeof setTimeout> | null = null;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (timeoutId) clearTimeout(timeoutId);
+                res();
+              };
+
+              video.requestVideoFrameCallback(finish);
+              timeoutId = setTimeout(finish, 300);
+            });
+
+            if (isStaleRequest()) {
+              resolve(null);
+              return;
+            }
+
+            await new Promise<void>((res) => {
+              if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+                res();
+                return;
+              }
+
+              let settled = false;
+              let timeoutId: ReturnType<typeof setTimeout> | null = null;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (timeoutId) clearTimeout(timeoutId);
+                video.removeEventListener("loadeddata", finish);
+                video.removeEventListener("canplay", finish);
+                res();
+              };
+
+              video.addEventListener("loadeddata", finish);
+              video.addEventListener("canplay", finish);
+              timeoutId = setTimeout(finish, 250);
+            });
+
+            if (isStaleRequest()) {
+              resolve(null);
+              return;
+            }
+
+            const tempCanvas = document.createElement("canvas");
+            tempCanvas.width = canvasWidth;
+            tempCanvas.height = canvasHeight;
+            const tempCtx = tempCanvas.getContext("2d");
+            if (!tempCtx) {
+              resolve(null);
+              return;
+            }
+
+            const videoAspect = video.videoWidth / video.videoHeight;
+            const canvasAspect = canvasWidth / canvasHeight;
+            let drawWidth = canvasWidth;
+            let drawHeight = canvasHeight;
+            let offsetX = 0;
+            let offsetY = 0;
+
+            if (videoAspect > canvasAspect) {
+              drawHeight = canvasWidth / videoAspect;
+              offsetY = (canvasHeight - drawHeight) / 2;
+            } else {
+              drawWidth = canvasHeight * videoAspect;
+              offsetX = (canvasWidth - drawWidth) / 2;
+            }
+
+            tempCtx.fillStyle = previewBgRef.current;
+            tempCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+            tempCtx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+
+            const frame = await createImageBitmap(tempCanvas);
+            if (isStaleRequest()) {
+              frame.close();
+              resolve(null);
+              return;
+            }
+            scheduleScrubVideoRelease();
+            resolve(frame);
+          } catch {
+            const cached = videoElementCacheRef.current.get(clip.mediaId);
+            if (cached) {
+              releaseVideoElement(cached);
+              videoElementCacheRef.current.delete(clip.mediaId);
+            }
+            scheduleScrubVideoRelease();
+            resolve(null);
+          }
+        }, 50);
+      });
     },
-    [getMediaItem],
+    [
+      evictOldestVideoElement,
+      getMediaItem,
+      releaseVideoElement,
+      scheduleScrubVideoRelease,
+    ],
   );
 
   // Render a single frame using MediaBunny (for scrubbing/seeking)
@@ -1235,11 +1886,11 @@ export const Preview: React.FC = () => {
               blendedFrame.height > 0
             ) {
               if (shouldClearCanvas) {
-                ctx.fillStyle = "#000000";
+                ctx.fillStyle = previewBgRef.current;
                 ctx.fillRect(0, 0, canvas.width, canvas.height);
                 shouldClearCanvas = false;
               }
-              renderOverlayClipsInTrackOrder(
+              await renderOverlayClipsInTrackOrder(
                 ctx,
                 timelineTracks,
                 activeShapeClips,
@@ -1250,7 +1901,7 @@ export const Preview: React.FC = () => {
                 "below-video",
               );
               ctx.drawImage(blendedFrame, 0, 0);
-              renderOverlayClipsInTrackOrder(
+              await renderOverlayClipsInTrackOrder(
                 ctx,
                 timelineTracks,
                 activeShapeClips,
@@ -1259,7 +1910,17 @@ export const Preview: React.FC = () => {
                 canvas.width,
                 canvas.height,
                 "above-video",
+                hasBehindSubjectText(activeTextClips) ? blendedFrame : null,
               );
+              if (processedOutgoing !== outgoingFrame) {
+                processedOutgoing.close();
+              }
+              if (processedIncoming !== incomingFrame) {
+                processedIncoming.close();
+              }
+              outgoingFrame.close();
+              incomingFrame.close();
+              blendedFrame.close();
               hasRenderedFrame = true;
             }
           } else if (outgoingFrame) {
@@ -1272,11 +1933,11 @@ export const Preview: React.FC = () => {
                 ? processed
                 : outgoingFrame;
             if (shouldClearCanvas) {
-              ctx.fillStyle = "#000000";
+              ctx.fillStyle = previewBgRef.current;
               ctx.fillRect(0, 0, canvas.width, canvas.height);
               shouldClearCanvas = false;
             }
-            renderOverlayClipsInTrackOrder(
+            await renderOverlayClipsInTrackOrder(
               ctx,
               timelineTracks,
               activeShapeClips,
@@ -1287,7 +1948,7 @@ export const Preview: React.FC = () => {
               "below-video",
             );
             ctx.drawImage(validFrame, 0, 0);
-            renderOverlayClipsInTrackOrder(
+            await renderOverlayClipsInTrackOrder(
               ctx,
               timelineTracks,
               activeShapeClips,
@@ -1296,7 +1957,12 @@ export const Preview: React.FC = () => {
               canvas.width,
               canvas.height,
               "above-video",
+              hasBehindSubjectText(activeTextClips) ? validFrame : null,
             );
+            if (processed !== outgoingFrame) {
+              processed.close();
+            }
+            outgoingFrame.close();
             hasRenderedFrame = true;
           } else if (incomingFrame) {
             const processed = await applyEffectsToFrame(
@@ -1308,11 +1974,11 @@ export const Preview: React.FC = () => {
                 ? processed
                 : incomingFrame;
             if (shouldClearCanvas) {
-              ctx.fillStyle = "#000000";
+              ctx.fillStyle = previewBgRef.current;
               ctx.fillRect(0, 0, canvas.width, canvas.height);
               shouldClearCanvas = false;
             }
-            renderOverlayClipsInTrackOrder(
+            await renderOverlayClipsInTrackOrder(
               ctx,
               timelineTracks,
               activeShapeClips,
@@ -1323,7 +1989,7 @@ export const Preview: React.FC = () => {
               "below-video",
             );
             ctx.drawImage(validFrame, 0, 0);
-            renderOverlayClipsInTrackOrder(
+            await renderOverlayClipsInTrackOrder(
               ctx,
               timelineTracks,
               activeShapeClips,
@@ -1332,7 +1998,12 @@ export const Preview: React.FC = () => {
               canvas.width,
               canvas.height,
               "above-video",
+              hasBehindSubjectText(activeTextClips) ? validFrame : null,
             );
+            if (processed !== incomingFrame) {
+              processed.close();
+            }
+            incomingFrame.close();
             hasRenderedFrame = true;
           }
         } catch (error) {
@@ -1377,6 +2048,9 @@ export const Preview: React.FC = () => {
           )
           .sort((a, b) => b.originalIndex - a.originalIndex);
 
+        let subjectFrame: ImageBitmap | null = null;
+        const shouldCompositeSubject = hasBehindSubjectText(activeTextClips);
+
         for (const { track } of allRenderableTracks) {
           if (track.type === "video" || track.type === "image") {
             for (const clip of track.clips) {
@@ -1393,6 +2067,15 @@ export const Preview: React.FC = () => {
 
                 if (frame) {
                   const clipLocalTime = time - clip.startTime;
+                  const speedEngine = getSpeedEngine();
+                  const adjustedLocalTime = speedEngine.getSourceTimeAtPlaybackTime(
+                    clip.id,
+                    clipLocalTime,
+                  );
+                  const sourceTime = Math.max(
+                    clip.inPoint,
+                    Math.min(clip.outPoint, clip.inPoint + adjustedLocalTime),
+                  );
                   let animatedTransform = getAnimatedTransform(
                     clip.transform as ClipTransform,
                     clip.keyframes,
@@ -1434,16 +2117,24 @@ export const Preview: React.FC = () => {
                     };
                   }
 
+                  const stabilizedTransform = applyStabilizationTransform(
+                    clip,
+                    animatedTransform,
+                    sourceTime,
+                    canvas.width,
+                    canvas.height,
+                    frame.width,
+                    frame.height,
+                  );
+
+                  let processedFrame: ImageBitmap | null = null;
                   try {
-                    const processedFrame = await applyEffectsToFrame(
-                      clip.id,
-                      frame,
-                    );
+                    processedFrame = await applyEffectsToFrame(clip.id, frame);
                     if (processedFrame.width > 0 && processedFrame.height > 0) {
                       drawFrameWithTransform(
                         ctx,
                         processedFrame,
-                        animatedTransform,
+                        stabilizedTransform,
                         canvas.width,
                         canvas.height,
                       );
@@ -1452,7 +2143,7 @@ export const Preview: React.FC = () => {
                       drawFrameWithTransform(
                         ctx,
                         frame,
-                        animatedTransform,
+                        stabilizedTransform,
                         canvas.width,
                         canvas.height,
                       );
@@ -1462,12 +2153,26 @@ export const Preview: React.FC = () => {
                     drawFrameWithTransform(
                       ctx,
                       frame,
-                      animatedTransform,
+                      stabilizedTransform,
                       canvas.width,
                       canvas.height,
                     );
                     hasRenderedFrame = true;
+                  } finally {
+                    if (processedFrame && processedFrame !== frame) {
+                      processedFrame.close();
+                    }
                   }
+
+                  if (shouldCompositeSubject) {
+                    subjectFrame?.close();
+                    subjectFrame = await captureSubjectFrame(
+                      ctx,
+                      canvas.width,
+                      canvas.height,
+                    );
+                  }
+                  frame.close();
                 }
               }
             }
@@ -1490,17 +2195,20 @@ export const Preview: React.FC = () => {
               (tc) => tc.trackId === track.id,
             );
             for (const textClip of trackTextClips) {
-              renderTextClipToCanvas(
+              await renderTextClipWithSubjectMask(
                 ctx,
                 textClip,
                 canvas.width,
                 canvas.height,
                 time,
+                subjectFrame,
               );
+
               hasRenderedFrame = true;
             }
           }
         }
+        subjectFrame?.close();
       }
 
       const activeSubtitles = getActiveSubtitles(allSubtitles, time);
@@ -1536,6 +2244,30 @@ export const Preview: React.FC = () => {
       isDark,
     ],
   );
+
+  const renderFrameDirectlyRef = useRef(renderFrameDirectly);
+  useEffect(() => {
+    renderFrameDirectlyRef.current = renderFrameDirectly;
+  }, [renderFrameDirectly]);
+
+  const isPlayingRef = useRef(isPlaying);
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  const playheadPositionRef = useRef(playheadPosition);
+  useEffect(() => {
+    playheadPositionRef.current = playheadPosition;
+  }, [playheadPosition]);
+
+  useEffect(() => {
+    setImageLoadCallback(() => {
+      if (!isPlayingRef.current) {
+        renderFrameDirectlyRef.current(playheadPositionRef.current);
+      }
+    });
+    return () => setImageLoadCallback(null);
+  }, []);
 
   const renderFallbackFrame = useCallback(
     (time: number) => {
@@ -1746,13 +2478,34 @@ export const Preview: React.FC = () => {
             if (mediaItem?.blob && mediaItem.type === "video") {
               const clipSpeed = speedEngine.getClipSpeed(clip.id);
               const isReverse = speedEngine.isReverse(clip.id);
-              if (clipSpeed !== 1 || isReverse) {
+              if (clipSpeed !== 1 || isReverse || clipNeedsFrameProcessing(clip.id)) {
                 return { canUse: false, clips: [] };
               }
               allVideoClips.push({ clip, mediaItem });
             }
           }
         }
+      }
+
+      const hasActiveAudioEffects = tracks.some(
+        (track) =>
+          (track.type === "audio" || track.type === "video") &&
+          !track.hidden &&
+          track.clips.some((clip) => {
+            if (clip.startTime + clip.duration <= startPosition) {
+              return false;
+            }
+
+            return getPreviewAudioEffects(
+              getResolvedClipAudioEffects(clip),
+            ).some(
+              (effect) => effect.enabled,
+            );
+          }),
+      );
+
+      if (hasActiveAudioEffects) {
+        return { canUse: false, clips: [] };
       }
 
       if (allVideoClips.length === 0) return { canUse: false, clips: [] };
@@ -1787,7 +2540,7 @@ export const Preview: React.FC = () => {
 
       return { canUse: true, clips: allVideoClips, imageClips };
     },
-    [timelineTracks, getMediaItem, allTextClips, allShapeClips],
+    [timelineTracks, getMediaItem, allTextClips, allShapeClips, getResolvedClipAudioEffects],
   );
 
   // Start native video playback using hardware-accelerated video elements (handles multiple clips)
@@ -1831,37 +2584,99 @@ export const Preview: React.FC = () => {
         }
       }
 
-      await preDecodeAllAudioBuffers();
+      try {
+        await preDecodeAllAudioBuffers();
+      } catch (error) {
+        console.warn("[Preview] Audio warmup failed:", error);
+      }
 
       const videoCache = new Map<
         string,
         { video: HTMLVideoElement; url: string }
       >();
-      const loadPromises: Promise<void>[] = [];
+      const loadingVideos = new Map<string, Promise<void>>();
 
-      for (const { clip, mediaItem } of clips) {
-        if (!videoCache.has(clip.mediaId) && mediaItem.blob) {
-          const url = URL.createObjectURL(mediaItem.blob);
-          const video = document.createElement("video");
-          video.src = url;
-          video.muted = true;
-          video.playsInline = true;
-          video.preload = "auto";
+      const loadVideoForClip = (
+        clip: (typeof timelineTracks)[0]["clips"][0],
+        mediaItem: NonNullable<ReturnType<typeof getMediaItem>>,
+      ): Promise<void> => {
+        const vidstabCheck = getVidstabEngine();
+        const clipStabilized = vidstabCheck.hasStabilized(clip.id);
+        const videoCacheId = clipStabilized ? `stabilized:${clip.id}` : clip.mediaId;
 
-          videoCache.set(clip.mediaId, { video, url });
-
-          loadPromises.push(
-            new Promise<void>((resolve, reject) => {
-              video.onloadedmetadata = () => resolve();
-              video.onerror = () =>
-                reject(new Error(`Video load failed for ${clip.mediaId}`));
-              setTimeout(() => resolve(), 5000); // Don't fail on timeout, just continue
-            }),
-          );
+        const existingLoad = loadingVideos.get(videoCacheId);
+        if (existingLoad) {
+          return existingLoad;
         }
+
+        const cachedVideo = videoCache.get(videoCacheId)?.video;
+        if (cachedVideo) {
+          if (cachedVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+            return Promise.resolve();
+          }
+        }
+
+        if (!mediaItem.blob) {
+          return Promise.resolve();
+        }
+
+        const vidstabEng = getVidstabEngine();
+        const isStabilized = vidstabEng.hasStabilized(clip.id);
+        const playBlob = (isStabilized
+          ? vidstabEng.getStabilizedBlob(clip.id)
+          : mediaItem.blob)!;
+        const cacheId = isStabilized ? `stabilized:${clip.id}` : clip.mediaId;
+        const url = URL.createObjectURL(playBlob);
+        const video = document.createElement("video");
+        video.src = url;
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = "auto";
+
+        videoCache.set(cacheId, { video, url });
+
+        const loadPromise = new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            video.onloadedmetadata = null;
+            video.onloadeddata = null;
+            video.oncanplay = null;
+            video.onerror = null;
+            loadingVideos.delete(cacheId);
+            resolve();
+          };
+          video.onloadeddata = finish;
+          video.oncanplay = finish;
+          video.onloadedmetadata = () => {
+            if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+              finish();
+            }
+          };
+          video.onerror = finish;
+          video.load();
+          setTimeout(finish, 1200);
+        });
+
+        loadingVideos.set(cacheId, loadPromise);
+        return loadPromise;
+      };
+
+      const activeStartClip = clips.find(
+        ({ clip }) =>
+          startPosition >= clip.startTime &&
+          startPosition < clip.startTime + clip.duration,
+      );
+      if (activeStartClip) {
+        await loadVideoForClip(activeStartClip.clip, activeStartClip.mediaItem);
       }
 
-      await Promise.all(loadPromises);
+      for (const entry of clips) {
+        if (entry !== activeStartClip) {
+          loadVideoForClip(entry.clip, entry.mediaItem).catch(() => {});
+        }
+      }
 
       const masterClock = getMasterClock();
       masterClock.setDuration(actualEndTime);
@@ -1871,7 +2686,7 @@ export const Preview: React.FC = () => {
         audioGraphRef.current = getRealtimeAudioGraph();
       }
       const audioGraph = audioGraphRef.current;
-      audioGraph.setMasterVolume(isMuted ? 0 : 1);
+      audioGraph.setPreviewMuted(isMuted);
 
       const tracksWithAudio = timelineTracks.filter(
         (t) => (t.type === "audio" || t.type === "video") && !t.hidden,
@@ -1889,42 +2704,8 @@ export const Preview: React.FC = () => {
 
       await audioGraph.resume();
       audioGraph.seekTo(startPosition);
-      audioGraph.startScheduler(() => {
-        const tracksWithAudio = timelineTracks.filter(
-          (t) => (t.type === "audio" || t.type === "video") && !t.hidden,
-        );
-        const schedules: AudioClipSchedule[] = [];
-        for (const track of tracksWithAudio) {
-          for (const audioClip of track.clips) {
-            const mediaItem = getMediaItem(audioClip.mediaId);
-            const hasAudio =
-              mediaItem?.type === "audio" ||
-              (mediaItem?.type === "video" &&
-                mediaItem?.metadata?.channels &&
-                mediaItem.metadata.channels > 0);
-            if (!hasAudio) continue;
-
-            const audioBuffer = audioBufferCacheRef.current.get(audioClip.mediaId);
-            if (audioBuffer) {
-              schedules.push({
-                clipId: audioClip.id,
-                trackId: track.id,
-                audioBuffer,
-                startTime: audioClip.startTime,
-                endTime: audioClip.startTime + audioClip.duration,
-                mediaOffset: audioClip.inPoint || 0,
-                volume: 1,
-                pan: 0,
-                effects: [],
-                speed: audioClip.speed ?? 1,
-              });
-            }
-          }
-        }
-        return schedules;
-      });
-
       await masterClock.play();
+      audioGraph.startScheduler(getAudioClipsForScheduler);
 
       let isActive = true;
       let rafId: number | null = null;
@@ -1937,6 +2718,90 @@ export const Preview: React.FC = () => {
           }
         }
         return null;
+      };
+
+      const findNextNativeClip = (clipId: string) => {
+        const sorted = [...clips].sort((a, b) => a.clip.startTime - b.clip.startTime);
+        const index = sorted.findIndex(({ clip }) => clip.id === clipId);
+        return index >= 0 ? sorted[index + 1] ?? null : null;
+      };
+
+      const findNativeClipById = (clipId: string) =>
+        clips.find(({ clip }) => clip.id === clipId) ?? null;
+
+      const waitForDrawableVideoFrame = async (
+        video: HTMLVideoElement,
+        timeoutMs = 300,
+      ): Promise<void> => {
+        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          return;
+        }
+
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          let timeoutId: ReturnType<typeof setTimeout> | null = null;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (timeoutId) clearTimeout(timeoutId);
+            video.removeEventListener("loadeddata", finish);
+            video.removeEventListener("canplay", finish);
+            resolve();
+          };
+          video.addEventListener("loadeddata", finish);
+          video.addEventListener("canplay", finish);
+          timeoutId = setTimeout(finish, timeoutMs);
+        });
+      };
+
+      const syncVideoToClipTime = async (
+        video: HTMLVideoElement,
+        clip: (typeof clips)[0]["clip"],
+        time: number,
+      ): Promise<void> => {
+        const speedEngine = getSpeedEngine();
+        const localTime = Math.max(
+          0,
+          Math.min(clip.duration, time - clip.startTime),
+        );
+        const adjustedLocalTime = speedEngine.getSourceTimeAtPlaybackTime(
+          clip.id,
+          localTime,
+        );
+        const sourceTime = Math.max(
+          clip.inPoint,
+          Math.min(clip.outPoint, clip.inPoint + adjustedLocalTime),
+        );
+        const vidstabPlay = getVidstabEngine();
+        const videoTime = vidstabPlay.hasStabilized(clip.id)
+          ? sourceTime - clip.inPoint
+          : sourceTime;
+
+        let needsDrawableWait = video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA;
+        if (Math.abs(video.currentTime - videoTime) > 0.1) {
+          needsDrawableWait = true;
+          await new Promise<void>((resolve) => {
+            let settled = false;
+            let timeoutId: ReturnType<typeof setTimeout> | null = null;
+            const finish = () => {
+              if (settled) return;
+              settled = true;
+              if (timeoutId) clearTimeout(timeoutId);
+              video.removeEventListener("seeked", finish);
+              resolve();
+            };
+            video.addEventListener("seeked", finish);
+            timeoutId = setTimeout(finish, 250);
+            video.currentTime = videoTime;
+          });
+        } else if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          needsDrawableWait = true;
+          video.currentTime = videoTime;
+        }
+
+        if (needsDrawableWait) {
+          await waitForDrawableVideoFrame(video);
+        }
       };
 
       const drawFrame = async () => {
@@ -1960,10 +2825,119 @@ export const Preview: React.FC = () => {
           return;
         }
 
+        const transitionInfo = getTransitionAtTime(
+          currentPlayhead,
+          timelineTracksRef.current,
+        );
+        if (transitionInfo) {
+          const outgoingClip = findNativeClipById(transitionInfo.clipA.id);
+          const incomingClip = findNativeClipById(transitionInfo.clipB.id);
+
+          if (outgoingClip && incomingClip) {
+            await Promise.all([
+              loadVideoForClip(outgoingClip.clip, outgoingClip.mediaItem),
+              loadVideoForClip(incomingClip.clip, incomingClip.mediaItem),
+            ]);
+            if (!isActive || !nativePlaybackActiveRef.current) return;
+
+            const outgoingCacheId = getVidstabEngine().hasStabilized(
+              outgoingClip.clip.id,
+            )
+              ? `stabilized:${outgoingClip.clip.id}`
+              : outgoingClip.clip.mediaId;
+            const incomingCacheId = getVidstabEngine().hasStabilized(
+              incomingClip.clip.id,
+            )
+              ? `stabilized:${incomingClip.clip.id}`
+              : incomingClip.clip.mediaId;
+            const outgoingVideo = videoCache.get(outgoingCacheId)?.video;
+            const incomingVideo = videoCache.get(incomingCacheId)?.video;
+
+            if (outgoingVideo && incomingVideo) {
+              await Promise.all([
+                syncVideoToClipTime(
+                  outgoingVideo,
+                  outgoingClip.clip,
+                  currentPlayhead,
+                ),
+                syncVideoToClipTime(
+                  incomingVideo,
+                  incomingClip.clip,
+                  currentPlayhead,
+                ),
+              ]);
+              if (!isActive || !nativePlaybackActiveRef.current) return;
+              if (outgoingVideo.paused) outgoingVideo.play().catch(() => {});
+              if (incomingVideo.paused) incomingVideo.play().catch(() => {});
+
+              const blended = await renderTransitionCanvas(
+                transitionInfo,
+                outgoingVideo,
+                incomingVideo,
+              );
+              if (!isActive || !nativePlaybackActiveRef.current) return;
+              ctx.fillStyle = previewBgRef.current;
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(blended, 0, 0, canvas.width, canvas.height);
+
+              const activeShapeClipsTr = getActiveShapeClips(
+                allShapeClipsRef.current,
+                currentPlayhead,
+              );
+              const activeTextClipsTr = getActiveTextClips(
+                allTextClipsRef.current,
+                currentPlayhead,
+              );
+              if (
+                activeShapeClipsTr.length > 0 ||
+                activeTextClipsTr.length > 0
+              ) {
+                await renderOverlayClipsInTrackOrder(
+                  ctx,
+                  timelineTracksRef.current,
+                  activeShapeClipsTr,
+                  activeTextClipsTr,
+                  currentPlayhead,
+                  canvas.width,
+                  canvas.height,
+                  "all",
+                );
+              }
+
+              const activeSubtitlesTr = getActiveSubtitles(
+                allSubtitles,
+                currentPlayhead,
+              );
+              for (const subtitle of activeSubtitlesTr) {
+                renderSubtitleToCanvas(
+                  ctx,
+                  subtitle,
+                  canvas.width,
+                  canvas.height,
+                  currentPlayhead,
+                );
+              }
+
+              const nowTransition = performance.now();
+              if (
+                nowTransition - lastPlayheadUpdateRef.current >=
+                PLAYHEAD_UPDATE_THROTTLE_MS
+              ) {
+                lastPlayheadUpdateRef.current = nowTransition;
+                setPlayheadPosition(currentPlayhead);
+              }
+              rafId = requestAnimationFrame(() => {
+                drawFrame();
+              });
+              return;
+            }
+          }
+        }
+
         const activeClip = findClipAtTime(currentPlayhead);
 
         if (!activeClip) {
-          ctx.fillStyle = "#000000";
+          ctx.fillStyle = previewBgRef.current;
           ctx.fillRect(0, 0, canvas.width, canvas.height);
 
           const sortedImageClipsNoVideo = [...imageClips].sort(
@@ -2010,7 +2984,7 @@ export const Preview: React.FC = () => {
           );
 
           if (activeShapeClipsNoVideo.length > 0 || activeTextClipsNoVideo.length > 0) {
-            renderOverlayClipsInTrackOrder(
+            await renderOverlayClipsInTrackOrder(
               ctx,
               timelineTracksRef.current,
               activeShapeClipsNoVideo,
@@ -2045,10 +3019,15 @@ export const Preview: React.FC = () => {
           return;
         }
 
-        const { clip } = activeClip;
-        const cached = videoCache.get(clip.mediaId);
+        const { clip, mediaItem } = activeClip;
+        const vidstabPlay = getVidstabEngine();
+        const clipIsStabilized = vidstabPlay.hasStabilized(clip.id);
+        const playbackCacheId = clipIsStabilized ? `stabilized:${clip.id}` : clip.mediaId;
+        const cached = videoCache.get(playbackCacheId);
 
         if (!cached) {
+          await loadVideoForClip(clip, mediaItem);
+          if (!isActive || !nativePlaybackActiveRef.current) return;
           const nowNoCached = performance.now();
           if (nowNoCached - lastPlayheadUpdateRef.current >= PLAYHEAD_UPDATE_THROTTLE_MS) {
             lastPlayheadUpdateRef.current = nowNoCached;
@@ -2062,16 +3041,6 @@ export const Preview: React.FC = () => {
 
         if (currentClipId !== clip.id) {
           currentClipId = clip.id;
-          if (video.paused) {
-            video.play().catch(() => {});
-          }
-        }
-
-        const clipLocalTime = currentPlayhead - clip.startTime;
-        const targetMediaTime = (clip.inPoint || 0) + clipLocalTime;
-        const drift = Math.abs(video.currentTime - targetMediaTime);
-        if (drift > 0.1) {
-          video.currentTime = targetMediaTime;
         }
 
         const latestClip = (() => {
@@ -2081,6 +3050,31 @@ export const Preview: React.FC = () => {
           }
           return clip;
         })();
+
+        const clipLocalTime = currentPlayhead - latestClip.startTime;
+        const speedEngine = getSpeedEngine();
+        const adjustedLocalTime = speedEngine.getSourceTimeAtPlaybackTime(
+          latestClip.id,
+          clipLocalTime,
+        );
+        const sourceTime = Math.max(
+          latestClip.inPoint,
+          Math.min(latestClip.outPoint, latestClip.inPoint + adjustedLocalTime),
+        );
+        await syncVideoToClipTime(video, latestClip, currentPlayhead);
+        if (!isActive || !nativePlaybackActiveRef.current) return;
+        if (video.paused) {
+          video.play().catch(() => {});
+        }
+
+        const timeUntilClipEnd =
+          latestClip.startTime + latestClip.duration - currentPlayhead;
+        if (timeUntilClipEnd <= 1.0) {
+          const nextClip = findNextNativeClip(latestClip.id);
+          if (nextClip) {
+            loadVideoForClip(nextClip.clip, nextClip.mediaItem).catch(() => {});
+          }
+        }
 
         let transform = getAnimatedTransform(
           (latestClip.transform as ClipTransform) || DEFAULT_TRANSFORM,
@@ -2108,7 +3102,7 @@ export const Preview: React.FC = () => {
           };
         }
 
-        ctx.fillStyle = "#000000";
+        ctx.fillStyle = previewBgRef.current;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
         // Sort by track index descending (higher index = background = render first)
@@ -2156,12 +3150,60 @@ export const Preview: React.FC = () => {
           currentPlayhead,
         );
 
-        drawFrameWithTransform(ctx, video, transform, canvas.width, canvas.height);
+        const bgEngine = getBackgroundRemovalEngine();
+        const hasBgRemoval = bgEngine?.isInitialized() && bgEngine.getSettings(clip.id).enabled;
+
+        let videoFrame: HTMLVideoElement | ImageBitmap = video;
+        if (hasBgRemoval) {
+          try {
+            const rawBitmap = await createImageBitmap(video);
+            const processed = await applyEffectsToFrame(clip.id, rawBitmap);
+            if (!isActive || !nativePlaybackActiveRef.current) {
+              if (processed !== rawBitmap) {
+                processed.close();
+              }
+              rawBitmap.close();
+              return;
+            }
+            if (processed !== rawBitmap) {
+              rawBitmap.close();
+            }
+            videoFrame = processed;
+          } catch {
+            videoFrame = video;
+          }
+        }
+
+        let finalTransform = transform;
+        const vidstabEng = getVidstabEngine();
+        if (
+          latestClip.stabilization?.enabled &&
+          latestClip.stabilization.analyzed &&
+          !vidstabEng.hasStabilized(latestClip.id)
+        ) {
+          finalTransform = applyStabilizationTransform(
+            latestClip,
+            transform,
+            sourceTime,
+            canvas.width,
+            canvas.height,
+            video.videoWidth,
+            video.videoHeight,
+          );
+        }
+
+        drawFrameWithTransform(ctx, videoFrame, finalTransform, canvas.width, canvas.height);
+        if (videoFrame !== video && videoFrame instanceof ImageBitmap) {
+          videoFrame.close();
+        }
+        const subjectFrame = hasBehindSubjectText(activeTextClips)
+          ? await captureSubjectFrame(ctx, canvas.width, canvas.height)
+          : null;
 
         // Use CPU canvas2D for all overlays - more reliable than GPU compositing
         // Render all text/graphics overlays (they're above the video since backgrounds are separate)
         if (activeShapeClips.length > 0 || activeTextClips.length > 0) {
-          renderOverlayClipsInTrackOrder(
+          await renderOverlayClipsInTrackOrder(
             ctx,
             timelineTracksRef.current,
             activeShapeClips,
@@ -2170,8 +3212,10 @@ export const Preview: React.FC = () => {
             canvas.width,
             canvas.height,
             "all",
+            subjectFrame,
           );
         }
+        subjectFrame?.close();
 
         const activeSubtitles = getActiveSubtitles(
           allSubtitles,
@@ -2203,10 +3247,8 @@ export const Preview: React.FC = () => {
         nativePlaybackActiveRef.current = false;
         if (rafId) cancelAnimationFrame(rafId);
 
-        for (const [, { video, url }] of videoCache) {
-          video.pause();
-          video.src = "";
-          URL.revokeObjectURL(url);
+        for (const [, entry] of videoCache) {
+          releaseVideoElement(entry);
         }
         videoCache.clear();
 
@@ -2229,8 +3271,11 @@ export const Preview: React.FC = () => {
       actualEndTime,
       allSubtitles,
       getMediaItem,
+      getAudioClipsForScheduler,
       isMuted,
       preDecodeAllAudioBuffers,
+      releaseVideoElement,
+      renderOverlayClipsInTrackOrder,
       setPlayheadPosition,
       timelineTracks,
     ],
@@ -2350,24 +3395,8 @@ export const Preview: React.FC = () => {
             canvas.height = settings.height;
           }
 
-          // Validate final canvas dimensions
-          const sinkWidth = canvas.width || settings.width;
-          const sinkHeight = canvas.height || settings.height;
-
-          if (sinkWidth === 0 || sinkHeight === 0) {
-            console.error(
-              "[Preview] Cannot create CanvasSink with zero dimensions",
-            );
-            input[Symbol.dispose]?.();
-            pause();
-            return;
-          }
-
           const sink = new CanvasSink(videoTrack, {
-            width: sinkWidth,
-            height: sinkHeight,
-            fit: "contain",
-            poolSize: getAdaptivePoolSize(sinkWidth, sinkHeight),
+            poolSize: 3,
           });
 
           const speedEngine = getSpeedEngine();
@@ -2552,55 +3581,55 @@ export const Preview: React.FC = () => {
                 };
               }
 
-              let processedFrame:
-                | ImageBitmap
-                | HTMLCanvasElement
-                | OffscreenCanvas = frameCanvas;
-              try {
-                const frameBitmap = await createImageBitmap(frameCanvas);
-                processedFrame = await applyEffectsToFrame(
-                  clip.id,
-                  frameBitmap,
-                );
-              } catch {}
-
               const useGPU =
                 rendererRef.current && rendererRef.current.type === "webgpu";
+              const preparedFrame = await preparePreviewFrame(
+                clip.id,
+                frameCanvas,
+                Boolean(useGPU),
+              );
+              const stabilizedTransform = applyStabilizationTransform(
+                clip,
+                transform,
+                currentMediaTime,
+                canvas.width,
+                canvas.height,
+                preparedFrame.frame.width,
+                preparedFrame.frame.height,
+              );
 
-              if (useGPU && processedFrame instanceof ImageBitmap) {
+              ctx.fillStyle = previewBgRef.current;
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              if (useGPU && preparedFrame.frame instanceof ImageBitmap) {
                 const gpuResult = await renderFrameWithGPU(
                   rendererRef.current!,
-                  processedFrame,
-                  transform,
+                  preparedFrame.frame,
+                  stabilizedTransform,
                   canvas.width,
                   canvas.height,
                 );
                 if (gpuResult) {
-                  ctx.clearRect(0, 0, canvas.width, canvas.height);
-                  ctx.drawImage(gpuResult, 0, 0);
+                  ctx.drawImage(gpuResult, 0, 0, canvas.width, canvas.height);
                   gpuResult.close();
                 } else {
-                  ctx.fillStyle = "#000000";
-                  ctx.fillRect(0, 0, canvas.width, canvas.height);
                   drawFrameWithTransform(
                     ctx,
-                    processedFrame,
-                    transform,
+                    preparedFrame.frame,
+                    stabilizedTransform,
                     canvas.width,
                     canvas.height,
                   );
                 }
               } else {
-                ctx.fillStyle = "#000000";
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
                 drawFrameWithTransform(
                   ctx,
-                  processedFrame,
-                  transform,
+                  preparedFrame.frame,
+                  stabilizedTransform,
                   canvas.width,
                   canvas.height,
                 );
               }
+              preparedFrame.cleanup();
 
               const nowPh = performance.now();
               if (nowPh - lastPlayheadUpdateRef.current >= PLAYHEAD_UPDATE_THROTTLE_MS) {
@@ -2691,13 +3720,8 @@ export const Preview: React.FC = () => {
           return null;
         }
 
-        const sinkWidth = settings.width || 1920;
-        const sinkHeight = settings.height || 1080;
         const sink = new CanvasSink(videoTrack, {
-          width: sinkWidth,
-          height: sinkHeight,
-          fit: "contain",
-          poolSize: getAdaptivePoolSize(sinkWidth, sinkHeight),
+          poolSize: 3,
         });
 
         return {
@@ -2775,7 +3799,9 @@ export const Preview: React.FC = () => {
         return;
       }
 
-      await preCacheAllImageBitmaps();
+      preCacheAllImageBitmaps().catch((error) => {
+        console.warn("[Preview] Image warmup failed:", error);
+      });
 
       for (const { clip, trackIndex } of initialClips) {
         if (!playbackResourcesRef.current.has(clip.id)) {
@@ -2798,13 +3824,17 @@ export const Preview: React.FC = () => {
         return;
       }
 
-      await preDecodeAllAudioBuffers();
+      try {
+        await preDecodeAllAudioBuffers();
+      } catch (error) {
+        console.warn("[Preview] Audio warmup failed:", error);
+      }
 
       if (!audioGraphRef.current) {
         audioGraphRef.current = getRealtimeAudioGraph();
       }
       const audioGraph = audioGraphRef.current;
-      audioGraph.setMasterVolume(isMuted ? 0 : 1);
+      audioGraph.setPreviewMuted(isMuted);
 
       const tracksWithAudio = timelineTracksRef.current.filter(
         (t) => (t.type === "audio" || t.type === "video") && !t.hidden,
@@ -2855,9 +3885,8 @@ export const Preview: React.FC = () => {
       masterClock.seek(playbackStartPosition);
 
       audioGraph.seekTo(playbackStartPosition);
-      audioGraph.startScheduler(getAudioClipsForScheduler);
-
       await masterClock.play();
+      audioGraph.startScheduler(getAudioClipsForScheduler);
 
       const frameDuration = 1000 / 30;
       let lastFrameTimestamp = performance.now();
@@ -2974,6 +4003,182 @@ export const Preview: React.FC = () => {
             }
           }
 
+          // Active transition takes over the whole frame: decode both clips
+          // (one will be outside its visible window — its sink will clamp to
+          // the nearest edge frame) and blend them. Overlays still render on
+          // top below.
+          const transitionInfoMulti = getTransitionAtTime(
+            currentPlayhead,
+            timelineTracksRef.current,
+          );
+
+          // Compute these here so they're visible in both the transition path
+          // and the normal compositing path below.
+          const activeShapeClips = getActiveShapeClips(
+            allShapeClipsRef.current,
+            currentPlayhead,
+          );
+          const activeTextClips = getActiveTextClips(
+            allTextClipsRef.current,
+            currentPlayhead,
+          );
+
+          if (transitionInfoMulti) {
+            const tracks = timelineTracksRef.current;
+            const findClipById = (id: string) => {
+              for (let idx = 0; idx < tracks.length; idx++) {
+                const found = tracks[idx].clips.find((c) => c.id === id);
+                if (found) return { clip: found, trackIndex: idx };
+              }
+              return null;
+            };
+
+            const aLookup = findClipById(transitionInfoMulti.clipA.id);
+            const bLookup = findClipById(transitionInfoMulti.clipB.id);
+
+            if (aLookup && bLookup) {
+              for (const lookup of [aLookup, bLookup]) {
+                if (!playbackResourcesRef.current.has(lookup.clip.id)) {
+                  const resources = await initClipResources(
+                    lookup.clip,
+                    lookup.trackIndex,
+                  );
+                  if (resources) {
+                    playbackResourcesRef.current.set(
+                      lookup.clip.id,
+                      resources,
+                    );
+                  }
+                }
+              }
+
+              const decodeClipFrameForTransition = async (
+                clip: (typeof tracks)[0]["clips"][0],
+              ): Promise<HTMLCanvasElement | OffscreenCanvas | null> => {
+                const resources = playbackResourcesRef.current.get(clip.id);
+                if (!resources) return null;
+                const speedEngine = getSpeedEngine();
+                const localTime = currentPlayhead - clip.startTime;
+                const adjustedLocalTime =
+                  speedEngine.getSourceTimeAtPlaybackTime(clip.id, localTime);
+                const sourceTime = Math.max(
+                  clip.inPoint,
+                  Math.min(
+                    clip.outPoint,
+                    (clip.inPoint || 0) + adjustedLocalTime,
+                  ),
+                );
+                try {
+                  const result = await (
+                    resources.sink as {
+                      getCanvas: (time: number) => Promise<{
+                        canvas: HTMLCanvasElement | OffscreenCanvas;
+                      } | null>;
+                    }
+                  ).getCanvas(sourceTime);
+                  if (!result?.canvas) return null;
+                  return result.canvas;
+                } catch (error) {
+                  console.warn(
+                    `[Preview] Transition decode failed for clip ${clip.id}:`,
+                    error,
+                  );
+                  return null;
+                }
+              };
+
+              const [outgoing, incoming] = await Promise.all([
+                decodeClipFrameForTransition(aLookup.clip),
+                decodeClipFrameForTransition(bLookup.clip),
+              ]);
+
+              if (outgoing && incoming) {
+                try {
+                  const blended = await renderTransitionCanvas(
+                    transitionInfoMulti,
+                    outgoing,
+                    incoming,
+                  );
+
+                  ctx.fillStyle = previewBgRef.current;
+                  ctx.fillRect(0, 0, canvas.width, canvas.height);
+                  ctx.drawImage(blended, 0, 0, canvas.width, canvas.height);
+
+                  for (const shapeClip of activeShapeClips) {
+                    renderShapeClipToCanvas(
+                      ctx,
+                      shapeClip,
+                      canvas.width,
+                      canvas.height,
+                      currentPlayhead,
+                    );
+                  }
+                  for (const textClip of activeTextClips) {
+                    renderTextClipToCanvas(
+                      ctx,
+                      textClip,
+                      canvas.width,
+                      canvas.height,
+                      currentPlayhead,
+                    );
+                  }
+                  const activeSubtitlesTr = getActiveSubtitles(
+                    allSubtitlesRef.current,
+                    currentPlayhead,
+                  );
+                  for (const subtitle of activeSubtitlesTr) {
+                    renderSubtitleToCanvas(
+                      ctx,
+                      subtitle,
+                      canvas.width,
+                      canvas.height,
+                      currentPlayhead,
+                    );
+                  }
+
+                  mainCtx.drawImage(offscreenCanvasRef.current!, 0, 0);
+
+                  frameCount++;
+                  masterClock.reportVideoTime(currentPlayhead);
+                  const nowTr = performance.now();
+                  if (
+                    nowTr - lastPlayheadUpdateRef.current >=
+                    PLAYHEAD_UPDATE_THROTTLE_MS
+                  ) {
+                    lastPlayheadUpdateRef.current = nowTr;
+                    setPlayheadPosition(currentPlayhead);
+                  }
+                  const elapsedTr = nowTr - lastFrameTimestamp;
+                  const targetTimeTr = frameDuration / rateRef.current;
+                  const delayTr = Math.max(0, targetTimeTr - elapsedTr);
+                  lastFrameTimestamp = nowTr;
+                  isProcessingFrame = false;
+                  if (isActive) {
+                    if (delayTr > 0) {
+                      setTimeout(() => {
+                        if (isActive) {
+                          animationRef.current = requestAnimationFrame(
+                            processMultiTrackFrame,
+                          );
+                        }
+                      }, delayTr);
+                    } else {
+                      animationRef.current = requestAnimationFrame(
+                        processMultiTrackFrame,
+                      );
+                    }
+                  }
+                  return;
+                } catch (error) {
+                  console.warn(
+                    "[Preview] Transition render failed, falling back to normal compositing:",
+                    error,
+                  );
+                }
+              }
+            }
+          }
+
           const activeClipIds = new Set(activeClips.map((c) => c.clip.id));
           for (const [clipId, resources] of playbackResourcesRef.current) {
             if (!activeClipIds.has(clipId)) {
@@ -2985,6 +4190,9 @@ export const Preview: React.FC = () => {
           const sortedClips = [...activeClips].sort(
             (a, b) => b.trackIndex - a.trackIndex,
           );
+          const activeTextNeedsSubject = hasBehindSubjectText(activeTextClips);
+          const useGPUFrames =
+            rendererRef.current?.type === "webgpu" && !activeTextNeedsSubject;
 
           const imageClipFrames: Array<{
             clip: (typeof sortedClips)[0]["clip"];
@@ -2997,6 +4205,7 @@ export const Preview: React.FC = () => {
               clip: (typeof sortedClips)[0]["clip"];
               transform: ClipTransform;
               frame: ImageBitmap | HTMLCanvasElement | OffscreenCanvas;
+              cleanup: () => void;
             } | null>
           > = [];
 
@@ -3062,7 +4271,10 @@ export const Preview: React.FC = () => {
                     clip.id,
                     clipLocalTime,
                   );
-                const mediaTime = (clip.inPoint || 0) + adjustedLocalTime;
+                const sourceTime = Math.max(
+                  clip.inPoint,
+                  Math.min(clip.outPoint, (clip.inPoint || 0) + adjustedLocalTime),
+                );
 
                 try {
                   const frameResult = await (
@@ -3073,27 +4285,33 @@ export const Preview: React.FC = () => {
                         duration: number;
                       } | null>;
                     }
-                  ).getCanvas(mediaTime);
+                  ).getCanvas(sourceTime);
 
                   if (!isActive) return null;
 
                   if (frameResult?.canvas) {
-                    let processedFrame:
-                      | ImageBitmap
-                      | HTMLCanvasElement
-                      | OffscreenCanvas = frameResult.canvas;
+                    const preparedFrame = await preparePreviewFrame(
+                      clip.id,
+                      frameResult.canvas,
+                      useGPUFrames,
+                    );
 
-                    try {
-                      const frameBitmap = await createImageBitmap(
-                        frameResult.canvas,
-                      );
-                      processedFrame = await applyEffectsToFrame(
-                        clip.id,
-                        frameBitmap,
-                      );
-                    } catch {}
+                    const stabilizedTransform = applyStabilizationTransform(
+                      clip,
+                      transform,
+                      sourceTime,
+                      canvas.width,
+                      canvas.height,
+                      preparedFrame.frame.width,
+                      preparedFrame.frame.height,
+                    );
 
-                    return { clip, transform, frame: processedFrame };
+                    return {
+                      clip,
+                      transform: stabilizedTransform,
+                      frame: preparedFrame.frame,
+                      cleanup: preparedFrame.cleanup,
+                    };
                   }
                 } catch (error) {
                   const errorMessage =
@@ -3123,17 +4341,9 @@ export const Preview: React.FC = () => {
             currentTextClips.length > 0 ||
             currentShapeClips.length > 0
           ) {
-            ctx.fillStyle = "#000000";
+            ctx.fillStyle = previewBgRef.current;
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            const activeShapeClips = getActiveShapeClips(
-              allShapeClipsRef.current,
-              currentPlayhead,
-            );
-            const activeTextClips = getActiveTextClips(
-              allTextClipsRef.current,
-              currentPlayhead,
-            );
             const tracks = timelineTracksRef.current;
 
             const clipToTrackIndex = new Map<string, number>();
@@ -3161,7 +4371,9 @@ export const Preview: React.FC = () => {
               .sort((a, b) => b.originalIndex - a.originalIndex);
 
             const useGPU =
-              rendererRef.current && rendererRef.current.type === "webgpu";
+              rendererRef.current &&
+              rendererRef.current.type === "webgpu" &&
+              !activeTextNeedsSubject;
 
             if (useGPU) {
               const gpuLayers: GPULayer[] = [];
@@ -3198,32 +4410,13 @@ export const Preview: React.FC = () => {
                     (sc) => sc.trackId === track.id,
                   );
                   for (const shapeClip of trackShapeClips) {
-                    const offscreen = new OffscreenCanvas(
+                    renderShapeClipToCanvas(
+                      ctx,
+                      shapeClip,
                       canvas.width,
                       canvas.height,
+                      currentPlayhead,
                     );
-                    const offCtx = offscreen.getContext("2d");
-                    if (offCtx) {
-                      renderShapeClipToCanvas(
-                        offCtx as unknown as CanvasRenderingContext2D,
-                        shapeClip,
-                        canvas.width,
-                        canvas.height,
-                        currentPlayhead,
-                      );
-                      const bitmap = await createImageBitmap(offscreen);
-                      tempBitmaps.push(bitmap);
-                      gpuLayers.push({
-                        bitmap,
-                        transform: {
-                          ...DEFAULT_TRANSFORM,
-                          opacity: 1,
-                          scale: { x: 1, y: 1 },
-                          position: { x: 0, y: 0 },
-                          anchor: { x: 0, y: 0 },
-                        },
-                      });
-                    }
                   }
                 } else if (track.type === "text") {
                   const trackTextClips = activeTextClips.filter(
@@ -3268,7 +4461,7 @@ export const Preview: React.FC = () => {
                   canvas.height,
                 );
                 if (gpuResult) {
-                  ctx.drawImage(gpuResult, 0, 0);
+                  ctx.drawImage(gpuResult, 0, 0, canvas.width, canvas.height);
                   gpuResult.close();
                 } else {
                   for (const layer of gpuLayers) {
@@ -3287,6 +4480,7 @@ export const Preview: React.FC = () => {
                 bitmap.close();
               }
             } else {
+              let subjectFrame: ImageBitmap | null = null;
               for (const { track, originalIndex } of allRenderableTracks) {
                 if (track.type === "video" || track.type === "image") {
                   const trackFrames = validFrames.filter(
@@ -3300,6 +4494,14 @@ export const Preview: React.FC = () => {
                       canvas.width,
                       canvas.height,
                     );
+                    if (activeTextNeedsSubject) {
+                      subjectFrame?.close();
+                      subjectFrame = await captureSubjectFrame(
+                        ctx,
+                        canvas.width,
+                        canvas.height,
+                      );
+                    }
                   }
                 } else if (track.type === "graphics") {
                   const trackShapeClips = activeShapeClips.filter(
@@ -3319,16 +4521,22 @@ export const Preview: React.FC = () => {
                     (tc) => tc.trackId === track.id,
                   );
                   for (const textClip of trackTextClips) {
-                    renderTextClipToCanvas(
+                    await renderTextClipWithSubjectMask(
                       ctx,
                       textClip,
                       canvas.width,
                       canvas.height,
                       currentPlayhead,
+                      subjectFrame,
                     );
                   }
                 }
               }
+              subjectFrame?.close();
+            }
+
+            for (const frame of validVideoFrames) {
+              frame.cleanup();
             }
 
             const activeSubtitles = getActiveSubtitles(
@@ -3531,7 +4739,8 @@ export const Preview: React.FC = () => {
       }
       if (videoElementRef.current) {
         videoElementRef.current.pause();
-        videoElementRef.current.src = "";
+        videoElementRef.current.removeAttribute("src");
+        videoElementRef.current.load();
         videoElementRef.current = null;
       }
       if (videoUrlRef.current) {
@@ -3560,37 +4769,111 @@ export const Preview: React.FC = () => {
   ]);
 
   const lastModifiedAtRef = useRef<number>(project.modifiedAt);
+  const lastPlayheadForRenderRef = useRef<number>(playheadPosition);
+  const modifiedRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const renderInFlightRef = useRef<boolean>(false);
+  const pendingRenderTimeRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (isPlaying) return;
 
-    // COMPLETELY skip rendering during resize/move interactions
-    // The last rendered frame stays visible, preventing black flashing
     if (isInteractingRef.current) {
       lastModifiedAtRef.current = project.modifiedAt;
       return;
     }
-    lastModifiedAtRef.current = project.modifiedAt;
 
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const renderFrame = async () => {
-      const rendered = await renderFrameDirectly(playheadPosition);
-      if (!rendered) {
-        renderFallbackFrame(playheadPosition);
+    const playheadChanged = playheadPosition !== lastPlayheadForRenderRef.current;
+    const modifiedChanged = project.modifiedAt !== lastModifiedAtRef.current;
+
+    lastModifiedAtRef.current = project.modifiedAt;
+    lastPlayheadForRenderRef.current = playheadPosition;
+
+    const previousRenderTime = lastPreviewRenderTimeRef.current;
+    const isLargeJump =
+      Math.abs(playheadPosition - previousRenderTime) > 1 ||
+      playheadPosition < previousRenderTime - 0.25;
+    if (isLargeJump) {
+      releaseScrubVideoElements();
+    }
+    lastPreviewRenderTimeRef.current = playheadPosition;
+
+    const doRender = async (time: number) => {
+      if (renderInFlightRef.current) {
+        // Coalesce: remember the latest requested position and render it
+        // once the current render completes. This is what makes scrubbing
+        // feel responsive even when each render is slower than mouse moves.
+        pendingRenderTimeRef.current = time;
+        return;
+      }
+      renderInFlightRef.current = true;
+      try {
+        const rendered = await renderFrameDirectly(time);
+        if (!rendered) {
+          renderFallbackFrame(time);
+        }
+      } finally {
+        renderInFlightRef.current = false;
+        const next = pendingRenderTimeRef.current;
+        if (next !== null && next !== time) {
+          pendingRenderTimeRef.current = null;
+          doRender(next);
+        } else {
+          pendingRenderTimeRef.current = null;
+        }
       }
     };
 
-    renderFrame();
+    if (playheadChanged) {
+      doRender(playheadPosition);
+    } else if (modifiedChanged) {
+      if (modifiedRenderTimerRef.current) {
+        clearTimeout(modifiedRenderTimerRef.current);
+      }
+      modifiedRenderTimerRef.current = setTimeout(() => {
+        modifiedRenderTimerRef.current = null;
+        doRender(playheadPosition);
+      }, 150);
+    }
+
+    return () => {
+      if (modifiedRenderTimerRef.current) {
+        clearTimeout(modifiedRenderTimerRef.current);
+        modifiedRenderTimerRef.current = null;
+      }
+    };
   }, [
     playheadPosition,
     isPlaying,
+    isScrubbing,
     renderFrameDirectly,
     renderFallbackFrame,
+    releaseScrubVideoElements,
     project.modifiedAt,
     isDark,
   ]);
+
+  const [previewInvalidateCounter, setPreviewInvalidateCounter] = useState(0);
+  useEffect(() => {
+    const handler = () => {
+      processedAudioBufferCacheRef.current.clear();
+      if (audioGraphRef.current) {
+        audioGraphRef.current.seekTo(getMasterClock().currentTime);
+      }
+      setPreviewInvalidateCounter((c) => c + 1);
+    };
+    window.addEventListener("openreel:preview-invalidate", handler);
+    return () => window.removeEventListener("openreel:preview-invalidate", handler);
+  }, []);
+
+  useEffect(() => {
+    if (isPlaying || previewInvalidateCounter === 0) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    renderFrameDirectly(playheadPosition);
+  }, [previewInvalidateCounter, isPlaying, renderFrameDirectly, playheadPosition]);
 
   const selectedClipId = useMemo(() => {
     const clipSelection = selectedItems.find((item) => item.type === "clip");
@@ -3684,8 +4967,42 @@ export const Preview: React.FC = () => {
 
     const displayScale = actualWidth / canvasWidth;
 
-    const clipWidth = canvasWidth * transform.scale.x * displayScale;
-    const clipHeight = canvasHeight * transform.scale.y * displayScale;
+    const fitMode =
+      !clipTransform.fitMode || clipTransform.fitMode === "none"
+        ? "contain"
+        : clipTransform.fitMode;
+    const mediaItem = getMediaItem(clip.mediaId);
+    const mediaWidth = mediaItem?.metadata?.width ?? canvasWidth;
+    const mediaHeight = mediaItem?.metadata?.height ?? canvasHeight;
+
+    let baseWidth: number;
+    let baseHeight: number;
+
+    if (fitMode === "stretch") {
+      baseWidth = canvasWidth;
+      baseHeight = canvasHeight;
+    } else if (fitMode === "cover") {
+      const mediaAspect = mediaWidth / mediaHeight;
+      if (mediaAspect > canvasAspect) {
+        baseHeight = canvasHeight;
+        baseWidth = canvasHeight * mediaAspect;
+      } else {
+        baseWidth = canvasWidth;
+        baseHeight = canvasWidth / mediaAspect;
+      }
+    } else {
+      const mediaAspect = mediaWidth / mediaHeight;
+      if (mediaAspect > canvasAspect) {
+        baseWidth = canvasWidth;
+        baseHeight = canvasWidth / mediaAspect;
+      } else {
+        baseHeight = canvasHeight;
+        baseWidth = canvasHeight * mediaAspect;
+      }
+    }
+
+    const clipWidth = baseWidth * transform.scale.x * displayScale;
+    const clipHeight = baseHeight * transform.scale.y * displayScale;
 
     const offsetX = transform.position.x * displayScale;
     const offsetY = transform.position.y * displayScale;
@@ -3712,6 +5029,7 @@ export const Preview: React.FC = () => {
     settings.height,
     canvasSize,
     liveTransform,
+    getMediaItem,
   ]);
 
   const textClipBounds = useMemo(() => {
@@ -3796,6 +5114,13 @@ export const Preview: React.FC = () => {
 
   const activeShapeClip = selectedShapeClip;
 
+  const [hoveredGraphicClipId, setHoveredGraphicClipId] = useState<string | null>(null);
+
+  const activeGraphicClips = useMemo(() => {
+    // getActiveShapeClips returns all graphic clip types (shapes, SVGs, and stickers)
+    return getActiveShapeClips(allShapeClips, playheadPosition);
+  }, [allShapeClips, playheadPosition]);
+
   const shapeClipBounds = useMemo(() => {
     if (!selectedShapeClip || !canvasRef.current || !overlayRef.current)
       return null;
@@ -3806,7 +5131,6 @@ export const Preview: React.FC = () => {
     const canvasRect = canvas.getBoundingClientRect();
 
     const { transform } = selectedShapeClip;
-    const shapeSize = 200;
 
     const canvasWidth = settings.width;
     const canvasHeight = settings.height;
@@ -3831,8 +5155,28 @@ export const Preview: React.FC = () => {
 
     const displayScale = actualWidth / canvasWidth;
 
-    const shapeWidth = shapeSize * transform.scale.x * displayScale;
-    const shapeHeight = shapeSize * transform.scale.y * displayScale;
+    let baseWidth: number;
+    let baseHeight: number;
+
+    if (selectedShapeClip.type === "svg") {
+      const svgClip = selectedShapeClip as SVGClip;
+      const svgWidth = svgClip.viewBox?.width || 200;
+      const svgHeight = svgClip.viewBox?.height || 200;
+      const svgAspect = svgWidth / svgHeight;
+      if (svgAspect > 1) {
+        baseWidth = canvasWidth;
+        baseHeight = canvasWidth / svgAspect;
+      } else {
+        baseHeight = canvasHeight;
+        baseWidth = canvasHeight * svgAspect;
+      }
+    } else {
+      baseWidth = 200;
+      baseHeight = 200;
+    }
+
+    const shapeWidth = baseWidth * transform.scale.x * displayScale;
+    const shapeHeight = baseHeight * transform.scale.y * displayScale;
 
     const posX = transform.position.x * canvasWidth * displayScale;
     const posY = transform.position.y * canvasHeight * displayScale;
@@ -3854,6 +5198,110 @@ export const Preview: React.FC = () => {
       isShapeClip: true,
     };
   }, [selectedShapeClip, settings.width, settings.height, canvasSize]);
+
+  const getGraphicClipDisplayBounds = useCallback(
+    (clip: ShapeClip | SVGClip | StickerClip) => {
+      if (!canvasRef.current || !overlayRef.current) return null;
+
+      const canvas = canvasRef.current;
+      const overlay = overlayRef.current;
+      const overlayRect = overlay.getBoundingClientRect();
+      const canvasRect = canvas.getBoundingClientRect();
+
+      const { transform } = clip;
+
+      const canvasWidth = settings.width;
+      const canvasHeight = settings.height;
+
+      const canvasAspect = canvasWidth / canvasHeight;
+      const elementAspect = canvasRect.width / canvasRect.height;
+
+      let actualWidth: number;
+      let actualHeight: number;
+      let letterboxOffsetX = 0;
+      let letterboxOffsetY = 0;
+
+      if (elementAspect > canvasAspect) {
+        actualHeight = canvasRect.height;
+        actualWidth = actualHeight * canvasAspect;
+        letterboxOffsetX = (canvasRect.width - actualWidth) / 2;
+      } else {
+        actualWidth = canvasRect.width;
+        actualHeight = actualWidth / canvasAspect;
+        letterboxOffsetY = (canvasRect.height - actualHeight) / 2;
+      }
+
+      const displayScale = actualWidth / canvasWidth;
+
+      let baseWidth: number;
+      let baseHeight: number;
+
+      if (clip.type === "svg") {
+        const svgClip = clip as SVGClip;
+        const svgW = svgClip.viewBox?.width || 200;
+        const svgH = svgClip.viewBox?.height || 200;
+        const svgAspect = svgW / svgH;
+        if (svgAspect > 1) {
+          baseWidth = canvasWidth;
+          baseHeight = canvasWidth / svgAspect;
+        } else {
+          baseHeight = canvasHeight;
+          baseWidth = canvasHeight * svgAspect;
+        }
+      } else {
+        baseWidth = 200;
+        baseHeight = 200;
+      }
+
+      const shapeWidth = baseWidth * transform.scale.x * displayScale;
+      const shapeHeight = baseHeight * transform.scale.y * displayScale;
+
+      const posX = transform.position.x * canvasWidth * displayScale;
+      const posY = transform.position.y * canvasHeight * displayScale;
+
+      const canvasOffsetX = canvasRect.left - overlayRect.left + letterboxOffsetX;
+      const canvasOffsetY = canvasRect.top - overlayRect.top + letterboxOffsetY;
+
+      const centerX = canvasOffsetX + posX;
+      const centerY = canvasOffsetY + posY;
+
+      return {
+        x: centerX - shapeWidth / 2,
+        y: centerY - shapeHeight / 2,
+        width: shapeWidth,
+        height: shapeHeight,
+        centerX,
+        centerY,
+      };
+    },
+    [settings.width, settings.height],
+  );
+
+  const findGraphicClipAtPoint = useCallback(
+    (clientX: number, clientY: number): ShapeClip | SVGClip | StickerClip | null => {
+      if (!overlayRef.current) return null;
+      const overlayRect = overlayRef.current.getBoundingClientRect();
+      const pointX = clientX - overlayRect.left;
+      const pointY = clientY - overlayRect.top;
+
+      for (let i = activeGraphicClips.length - 1; i >= 0; i--) {
+        const clip = activeGraphicClips[i];
+        const bounds = getGraphicClipDisplayBounds(clip);
+        if (!bounds) continue;
+
+        if (
+          pointX >= bounds.x &&
+          pointX <= bounds.x + bounds.width &&
+          pointY >= bounds.y &&
+          pointY <= bounds.y + bounds.height
+        ) {
+          return clip;
+        }
+      }
+      return null;
+    },
+    [activeGraphicClips, getGraphicClipDisplayBounds],
+  );
 
   const selectedSubtitleId = useMemo(() => {
     const subtitleSelection = selectedItems.find(
@@ -4120,6 +5568,32 @@ export const Preview: React.FC = () => {
     [activeShapeClip],
   );
 
+  const handleGraphicsMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      if (interactionMode !== "none") {
+        setHoveredGraphicClipId(null);
+        return;
+      }
+
+      const clip = findGraphicClipAtPoint(e.clientX, e.clientY);
+      setHoveredGraphicClipId(clip ? clip.id : null);
+    },
+    [interactionMode, findGraphicClipAtPoint],
+  );
+
+  const handleGraphicsClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (interactionMode !== "none") return;
+
+      const clip = findGraphicClipAtPoint(e.clientX, e.clientY);
+      if (clip) {
+        select({ type: "shape-clip", id: clip.id });
+        e.stopPropagation();
+      }
+    },
+    [interactionMode, findGraphicClipAtPoint, select],
+  );
+
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
       if (interactionMode === "none" || !interactionStartRef.current) return;
@@ -4304,8 +5778,17 @@ export const Preview: React.FC = () => {
         let newX = startTransform.x;
         let newY = startTransform.y;
 
-        const scaleDeltaX = deltaX / displayScale / (settings.width / 2);
-        const scaleDeltaY = deltaY / displayScale / (settings.height / 2);
+        // Base dimensions match how the clip is actually rendered so resize
+        // handles track the cursor regardless of fit mode.
+        const baseScaleW =
+          (clipBounds.width / displayScale) /
+          Math.max(0.001, startTransform.scaleX);
+        const baseScaleH =
+          (clipBounds.height / displayScale) /
+          Math.max(0.001, startTransform.scaleY);
+
+        const scaleDeltaX = deltaX / displayScale / (baseScaleW / 2);
+        const scaleDeltaY = deltaY / displayScale / (baseScaleH / 2);
 
         switch (activeHandle) {
           case "e":
@@ -4531,6 +6014,7 @@ export const Preview: React.FC = () => {
     if (!container) return;
 
     if (!document.fullscreenElement) {
+      setZoomLevel(1);
       container
         .requestFullscreen()
         .then(() => {
@@ -4552,6 +6036,7 @@ export const Preview: React.FC = () => {
   }, []);
 
   const handleMaximize = useCallback(() => {
+    setZoomLevel(1);
     setIsMaximized((prev) => !prev);
   }, []);
 
@@ -4572,8 +6057,11 @@ export const Preview: React.FC = () => {
 
   const showTextClipHandles = !isPlaying && selectedTextClip && textClipBounds;
 
+
   const showShapeClipHandles =
-    !isPlaying && selectedShapeClip && shapeClipBounds;
+    !isPlaying &&
+    selectedShapeClip &&
+    shapeClipBounds;
 
   const showSubtitleOverlay =
     !isPlaying && selectedSubtitleObj && subtitleBounds;
@@ -4618,8 +6106,18 @@ export const Preview: React.FC = () => {
     <div
       ref={containerRef}
       data-tour="preview"
-      className="flex-1 bg-background flex flex-col relative group overflow-hidden"
+      className="w-full h-full min-h-0 min-w-0 bg-stage-bg flex flex-col relative group overflow-hidden"
     >
+      {/* ── Panel bar header (mockup: 'Player') ───────────────── */}
+      {!isMaximized && !isFullscreen && (
+        <div className="flex items-center px-3.5 py-2 border-b border-border bg-bg-1 gap-2.5 min-h-[38px] shrink-0">
+          <h2 className="text-[13px] font-semibold tracking-tight text-fg m-0">Player</h2>
+          <div className="ml-auto flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent" title="Live preview" />
+          </div>
+        </div>
+      )}
+
       {/* Crop Mode View - Full Screen Overlay */}
       {shouldShowCropMode && (
         <CropModeView
@@ -4637,18 +6135,21 @@ export const Preview: React.FC = () => {
 
       {/* Video Area */}
       <div
-        className={`flex-1 relative flex items-center justify-center bg-background-secondary/30 transition-all duration-300 ${
+        ref={videoAreaRef}
+        className={`flex-1 min-h-0 min-w-0 relative flex items-center justify-center bg-stage-bg transition-all duration-300 ${
           isMaximized || isFullscreen ? "p-0" : "p-4"
-        }`}
+        } ${zoomLevel > 1 ? "overflow-auto" : ""}`}
         onMouseMove={interactionMode !== "none" ? handleMouseMove : undefined}
         onMouseUp={handleMouseUp}
       >
         <div
           ref={overlayRef}
-          className={`relative bg-black overflow-hidden transition-all duration-300 ${
+          className={`relative bg-[var(--screen-bg)] overflow-visible transition-all duration-300 ${
             isMaximized || isFullscreen
               ? "rounded-none ring-0 shadow-none"
-              : "shadow-2xl rounded-xl ring-1 ring-border shadow-[0_0_50px_rgba(0,0,0,0.5)]"
+              : isDark
+                ? "shadow-2xl rounded-xl ring-1 ring-border shadow-[0_0_50px_rgba(0,0,0,0.5)]"
+                : "rounded-xl ring-1 ring-border shadow-[0_10px_40px_rgba(0,0,0,0.1)]"
           }`}
           style={
             isMaximized || isFullscreen
@@ -4658,19 +6159,23 @@ export const Preview: React.FC = () => {
                   maxWidth: "none",
                 }
               : {
-                  height: "450px",
-                  width: `calc(450px * ${settings.width} / ${settings.height})`,
-                  maxWidth: "800px",
+                  width: `${previewFrameSize.width}px`,
+                  height: `${previewFrameSize.height}px`,
+                  maxWidth: "100%",
+                  maxHeight: "100%",
                 }
           }
+          onMouseMove={!isPlaying ? handleGraphicsMouseMove : undefined}
+          onClick={!isPlaying ? handleGraphicsClick : undefined}
+          onMouseLeave={() => setHoveredGraphicClipId(null)}
         >
           <canvas
             ref={canvasRef}
             width={settings.width}
             height={settings.height}
-            className="w-full h-full object-contain bg-black"
+            className="w-full h-full object-contain bg-[var(--screen-bg)]"
             style={{
-              cursor: "default",
+              cursor: hoveredGraphicClipId && !isPlaying ? "pointer" : "default",
             }}
           />
 
@@ -4849,6 +6354,21 @@ export const Preview: React.FC = () => {
                 <Move size={14} className="text-white" />
               </div>
 
+              {/* Aspect ratio lock toggle */}
+              <button
+                className={`absolute -top-8 left-1/2 -translate-x-1/2 px-2 py-1 text-[10px] rounded pointer-events-auto transition-colors ${
+                  lockAspectRatio
+                    ? "bg-cyan-500 text-white"
+                    : "bg-background-tertiary text-text-secondary border border-border hover:bg-background-elevated"
+                }`}
+                onClick={() => setLockAspectRatio(!lockAspectRatio)}
+                title={
+                  lockAspectRatio ? "Unlock aspect ratio" : "Lock aspect ratio"
+                }
+              >
+                {lockAspectRatio ? "🔒 Locked" : "🔓 Free"}
+              </button>
+
               {/* Corner resize handles */}
               <div
                 className="absolute -left-2 -top-2 w-4 h-4 bg-white border-2 border-cyan-500 rounded-sm cursor-nw-resize pointer-events-auto hover:bg-cyan-500 hover:border-white transition-colors"
@@ -4898,8 +6418,9 @@ export const Preview: React.FC = () => {
                 height: shapeClipBounds.height,
               }}
             >
-              {/* Selection border - green for shape clips */}
-              <div className="absolute inset-0 border-2 border-green-500 pointer-events-none" />
+              {selectedShapeClip.type !== "svg" && (
+                <div className="absolute inset-0 border-2 border-green-500 pointer-events-none" />
+              )}
 
               {/* Move handle (center) */}
               <div
@@ -4909,6 +6430,21 @@ export const Preview: React.FC = () => {
               >
                 <Move size={14} className="text-white" />
               </div>
+
+              {/* Aspect ratio lock toggle */}
+              <button
+                className={`absolute -top-8 left-1/2 -translate-x-1/2 px-2 py-1 text-[10px] rounded pointer-events-auto transition-colors ${
+                  lockAspectRatio
+                    ? "bg-green-500 text-white"
+                    : "bg-background-tertiary text-text-secondary border border-border hover:bg-background-elevated"
+                }`}
+                onClick={() => setLockAspectRatio(!lockAspectRatio)}
+                title={
+                  lockAspectRatio ? "Unlock aspect ratio" : "Lock aspect ratio"
+                }
+              >
+                {lockAspectRatio ? "🔒 Locked" : "🔓 Free"}
+              </button>
 
               {/* Corner resize handles */}
               <div
@@ -4966,6 +6502,36 @@ export const Preview: React.FC = () => {
               </div>
             </div>
           )}
+
+          {/* Graphic Clip Hover Indicators */}
+          {!cropMode && !isPlaying &&
+            activeGraphicClips.map((clip) => {
+              if (clip.type === "svg") return null;
+              if (clip.id === selectedShapeClipId) return null;
+              if (clip.id !== hoveredGraphicClipId) return null;
+              const bounds = getGraphicClipDisplayBounds(clip);
+              if (!bounds) return null;
+              return (
+                <div
+                  key={clip.id}
+                  className="absolute pointer-events-none z-10"
+                  style={{
+                    left: bounds.x,
+                    top: bounds.y,
+                    width: bounds.width,
+                    height: bounds.height,
+                  }}
+                >
+                  <div className="absolute inset-0 border-2 border-dashed border-white/80 rounded-sm" />
+                  <div
+                    aria-hidden="true"
+                    className="absolute -top-6 left-1/2 -translate-x-1/2 px-2 py-0.5 bg-black/70 rounded text-[10px] text-white whitespace-nowrap"
+                  >
+                    Click to select
+                  </div>
+                </div>
+              );
+            })}
         </div>
       </div>
 
@@ -4973,17 +6539,17 @@ export const Preview: React.FC = () => {
       <div
         className={`border-t border-border transition-all duration-300 ${
           isMaximized || isFullscreen
-            ? "absolute bottom-0 left-0 right-0 z-50 bg-background-secondary backdrop-blur-sm"
-            : "z-20 bg-background-secondary"
+            ? "absolute bottom-0 left-0 right-0 z-50 bg-bg-1 backdrop-blur-sm"
+            : "z-20 bg-bg-1"
         }`}
       >
         {/* Scrub Bar - integrated at top of controls */}
         <div
-          className="h-1.5 bg-background-tertiary cursor-pointer group hover:h-2.5 transition-all relative"
+          className="h-1.5 bg-bg-2 cursor-pointer group hover:h-2.5 transition-all relative"
           onClick={handleScrubClick}
         >
           <div
-            className="h-full bg-primary relative pointer-events-none shadow-[0_0_10px_rgba(34,197,94,0.5)]"
+            className="h-full bg-accent relative pointer-events-none shadow-glow"
             style={{ width: `${progressPercentage}%` }}
           >
             <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full shadow-md opacity-0 group-hover:opacity-100 transition-opacity transform scale-0 group-hover:scale-100 duration-100 border border-black/20" />
@@ -4991,11 +6557,13 @@ export const Preview: React.FC = () => {
         </div>
 
         {/* Controls row */}
-        <div className="h-12 px-6 flex items-center justify-between">
+        <div className="h-12 px-4 flex items-center gap-3">
         <div className="flex items-center gap-2">
-          <div className="font-mono text-text-primary tabular-nums text-sm w-24 tracking-wider">
-            {formatTime(playheadPosition)}
-          </div>
+          <span className="font-mono text-[11px] tabular-nums tracking-tight">
+            <span className="text-accent font-semibold">{formatTime(playheadPosition)}</span>
+            <span className="text-fg-3 mx-1">/</span>
+            <span className="text-fg-3">{formatTime(project.timeline.duration || 0)}</span>
+          </span>
 
           {rendererType !== "none" && (
             <span
@@ -5011,64 +6579,117 @@ export const Preview: React.FC = () => {
           )}
         </div>
 
-        <div className="flex items-center gap-6">
-          <IconButton
-            icon={SkipBack}
+        <div className="flex items-center gap-1 mx-auto">
+          <button
             onClick={handleSkipBack}
             title="Skip back 5s"
-          />
+            className="w-7 h-7 grid place-items-center rounded-md text-fg-2 hover:bg-hover hover:text-fg transition-colors"
+          >
+            <SkipBack size={13} />
+          </button>
           <button
             onClick={() => {
               togglePlayback();
             }}
-            className="w-10 h-10 rounded-full bg-primary hover:bg-primary-hover active:bg-primary-active flex items-center justify-center text-white transition-all shadow-[0_0_15px_rgba(34,197,94,0.4)] hover:shadow-[0_0_25px_rgba(34,197,94,0.6)] transform hover:scale-105"
+            disabled={Boolean(playbackLockedReason)}
+            title={playbackLockedReason ?? (isPlaying ? "Pause" : "Play")}
+            className={`w-8 h-8 rounded-full flex items-center justify-center transition-all ${
+              playbackLockedReason
+                ? "bg-bg-2 text-fg-muted cursor-not-allowed"
+                : "text-fg hover:bg-hover"
+            }`}
           >
             {isPlaying ? (
               <Pause size={18} fill="currentColor" />
+            ) : playbackLockedReason ? (
+              <Loader2 size={18} className="animate-spin" />
             ) : (
               <Play size={18} fill="currentColor" className="ml-0.5" />
             )}
           </button>
-          <IconButton
-            icon={SkipForward}
+          <button
             onClick={handleSkipForward}
             title="Skip forward 5s"
-          />
+            className="w-7 h-7 grid place-items-center rounded-md text-fg-2 hover:bg-hover hover:text-fg transition-colors"
+          >
+            <SkipForward size={13} />
+          </button>
         </div>
 
-        <div className="flex gap-2 items-center">
+        <div className="flex gap-1 items-center">
           <button
             onClick={() => setIsMuted(!isMuted)}
-            className={`p-2 rounded-lg hover:bg-background-elevated transition-colors ${
+            className={`w-7 h-7 grid place-items-center rounded-md transition-colors ${
               isMuted
-                ? "text-red-500"
-                : "text-text-secondary hover:text-text-primary"
+                ? "text-status-error"
+                : "text-fg-2 hover:text-fg hover:bg-hover"
             }`}
+            title={isMuted ? "Unmute" : "Mute"}
           >
-            {isMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+            {isMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
           </button>
-          <div className="w-px h-4 bg-border mx-2" />
+
+          {/* Zoom Control */}
+          <div className="relative">
+            <button
+              onClick={() => setShowZoomMenu(!showZoomMenu)}
+              className="px-2 py-0.5 rounded border border-border text-[10.5px] font-medium text-fg-2 hover:bg-hover hover:text-fg transition-colors"
+              title="Preview Zoom"
+            >
+              <div className="flex items-center gap-1">
+                <ZoomIn size={11} />
+                <span>{Math.round(zoomLevel * 100)}%</span>
+              </div>
+            </button>
+            {showZoomMenu && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setShowZoomMenu(false)}
+                />
+                <div className="absolute bottom-full mb-1 left-1/2 -translate-x-1/2 bg-bg-elev border border-border rounded-md shadow-md py-1 z-50 min-w-[80px]">
+                  {ZOOM_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      onClick={() => {
+                        setZoomLevel(opt.value);
+                        setShowZoomMenu(false);
+                      }}
+                      className={`w-full px-3 py-1.5 text-[11px] font-mono text-left hover:bg-hover transition-colors ${
+                        zoomLevel === opt.value
+                          ? "text-accent"
+                          : "text-fg-2"
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+
           <button
             onClick={handleFullscreen}
             title={isFullscreen ? "Exit Full Screen" : "Full Screen"}
-            className={`p-2 rounded-lg transition-colors ${
+            className={`w-7 h-7 grid place-items-center rounded-md transition-colors ${
               isFullscreen
-                ? "text-primary bg-primary/20"
-                : "text-text-secondary hover:text-text-primary hover:bg-background-elevated"
+                ? "bg-accent-soft text-accent"
+                : "text-fg-2 hover:text-fg hover:bg-hover"
             }`}
           >
-            <Monitor size={16} />
+            <Monitor size={14} />
           </button>
           <button
             onClick={handleMaximize}
             title={isMaximized ? "Restore Size" : "Maximize Preview"}
-            className={`p-2 rounded-lg transition-colors ${
+            className={`w-7 h-7 grid place-items-center rounded-md transition-colors ${
               isMaximized
-                ? "text-primary bg-primary/20"
-                : "text-text-secondary hover:text-text-primary hover:bg-background-elevated"
+                ? "bg-accent-soft text-accent"
+                : "text-fg-2 hover:text-fg hover:bg-hover"
             }`}
           >
-            {isMaximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+            {isMaximized ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
           </button>
         </div>
         </div>

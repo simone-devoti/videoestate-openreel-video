@@ -2,7 +2,9 @@ import {
   getMasterClock,
   MasterTimelineClock,
 } from "../playback/master-timeline-clock";
-import type { Effect } from "../types/timeline";
+import type { AutomationPoint, Effect } from "../types/timeline";
+import { createNoiseReductionNodeChain } from "./audio-effects-engine";
+import { scheduleVolumeAutomationOnGain } from "./clip-volume-automation";
 
 export interface AudioClipSchedule {
   clipId: string;
@@ -12,6 +14,7 @@ export interface AudioClipSchedule {
   endTime: number;
   mediaOffset: number;
   volume: number;
+  volumeAutomation: AutomationPoint[];
   pan: number;
   effects: Effect[];
   speed: number;
@@ -58,6 +61,7 @@ interface TrackNodes {
   outputGain: GainNode;
   compressor: DynamicsCompressorNode | null;
   eqFilters: BiquadFilterNode[];
+  noiseReductionNodes: AudioNode[];
   reverbNodes: ReverbNodes | null;
   delayNodes: DelayNodes | null;
 }
@@ -73,8 +77,14 @@ export class RealtimeAudioGraph {
   private impulseResponseCache: Map<string, AudioBuffer> = new Map();
   private isPlaying = false;
   private lastScheduledTime = 0;
+  private seekPending = false;
   private scheduleAheadTime = 0.2;
   private schedulerIntervalId: number | null = null;
+  /** Persist mixer volume/pan so they survive track recreate (e.g. on seek). */
+  private trackVolumeOverrides: Map<string, number> = new Map();
+  private trackPanOverrides: Map<string, number> = new Map();
+  private masterVolumeOverride = 1;
+  private previewMuted = false;
 
   constructor(masterClock?: MasterTimelineClock) {
     this.masterClock = masterClock || getMasterClock();
@@ -91,15 +101,27 @@ export class RealtimeAudioGraph {
     return this.masterGain;
   }
 
+  /** Set master volume from the mixer (1 = 0 dB, 4 = +12 dB). Persists across preview mute. */
   setMasterVolume(volume: number): void {
-    this.masterGain.gain.setValueAtTime(
-      Math.max(0, Math.min(4, volume)),
-      this.audioContext.currentTime,
-    );
+    this.masterVolumeOverride = Math.max(0, Math.min(4, volume));
+    this.applyMasterGain();
+  }
+
+  /** Mute/unmute preview without changing mixer master volume. */
+  setPreviewMuted(muted: boolean): void {
+    this.previewMuted = muted;
+    this.applyMasterGain();
+  }
+
+  private applyMasterGain(): void {
+    const v = this.previewMuted ? 0 : this.masterVolumeOverride;
+    this.masterGain.gain.setValueAtTime(v, this.audioContext.currentTime);
   }
 
   createTrack(config: TrackConfig): void {
     this.removeTrack(config.trackId);
+    config.volume = this.trackVolumeOverrides.get(config.trackId) ?? config.volume;
+    config.pan = this.trackPanOverrides.get(config.trackId) ?? config.pan;
     this.trackConfigs.set(config.trackId, config);
 
     const inputGain = this.audioContext.createGain();
@@ -113,6 +135,7 @@ export class RealtimeAudioGraph {
       effectChainOutput,
       compressor,
       eqFilters,
+      noiseReductionNodes,
       reverbNodes,
       delayNodes,
     } = this.buildEffectChain(config.effects);
@@ -130,6 +153,7 @@ export class RealtimeAudioGraph {
       outputGain,
       compressor,
       eqFilters,
+      noiseReductionNodes,
       reverbNodes,
       delayNodes,
     };
@@ -145,12 +169,14 @@ export class RealtimeAudioGraph {
     effectChainOutput: AudioNode;
     compressor: DynamicsCompressorNode | null;
     eqFilters: BiquadFilterNode[];
+    noiseReductionNodes: AudioNode[];
     reverbNodes: ReverbNodes | null;
     delayNodes: DelayNodes | null;
   } {
     const passthrough = this.audioContext.createGain();
     let compressor: DynamicsCompressorNode | null = null;
     const eqFilters: BiquadFilterNode[] = [];
+    const noiseReductionNodes: AudioNode[] = [];
     let reverbNodes: ReverbNodes | null = null;
     let delayNodes: DelayNodes | null = null;
 
@@ -161,6 +187,7 @@ export class RealtimeAudioGraph {
         effectChainOutput: passthrough,
         compressor,
         eqFilters,
+        noiseReductionNodes,
         reverbNodes,
         delayNodes,
       };
@@ -189,6 +216,13 @@ export class RealtimeAudioGraph {
           }
           break;
         }
+        case "noiseReduction": {
+          const chain = createNoiseReductionNodeChain(this.audioContext, effect);
+          currentNode.connect(chain.input);
+          currentNode = chain.output;
+          noiseReductionNodes.push(...chain.nodes);
+          break;
+        }
         case "reverb": {
           reverbNodes = this.createReverbNodes(effect);
           currentNode.connect(reverbNodes.inputGain);
@@ -209,6 +243,7 @@ export class RealtimeAudioGraph {
       effectChainOutput: currentNode,
       compressor,
       eqFilters,
+      noiseReductionNodes,
       reverbNodes,
       delayNodes,
     };
@@ -361,6 +396,7 @@ export class RealtimeAudioGraph {
       nodes.outputGain.disconnect();
       if (nodes.compressor) nodes.compressor.disconnect();
       for (const filter of nodes.eqFilters) filter.disconnect();
+      for (const node of nodes.noiseReductionNodes) node.disconnect();
       if (nodes.reverbNodes) {
         nodes.reverbNodes.inputGain.disconnect();
         nodes.reverbNodes.dryGain.disconnect();
@@ -383,26 +419,44 @@ export class RealtimeAudioGraph {
   }
 
   updateTrackVolume(trackId: string, volume: number): void {
+    const clamped = Math.max(0, Math.min(4, volume));
+    this.trackVolumeOverrides.set(trackId, clamped);
     const nodes = this.trackNodes.get(trackId);
     const config = this.trackConfigs.get(trackId);
     if (nodes && config) {
-      config.volume = Math.max(0, Math.min(4, volume));
+      config.volume = clamped;
       this.updateTrackAudibility(trackId);
     }
   }
 
   updateTrackPan(trackId: string, pan: number): void {
+    const clamped = Math.max(-1, Math.min(1, pan));
+    this.trackPanOverrides.set(trackId, clamped);
     const nodes = this.trackNodes.get(trackId);
     if (nodes) {
       nodes.panNode.pan.setValueAtTime(
-        Math.max(-1, Math.min(1, pan)),
+        clamped,
         this.audioContext.currentTime,
       );
     }
     const config = this.trackConfigs.get(trackId);
     if (config) {
-      config.pan = pan;
+      config.pan = clamped;
     }
+  }
+
+  getTrackVolume(trackId: string): number {
+    const config = this.trackConfigs.get(trackId);
+    return this.trackVolumeOverrides.get(trackId) ?? config?.volume ?? 1;
+  }
+
+  getTrackPan(trackId: string): number {
+    const config = this.trackConfigs.get(trackId);
+    return this.trackPanOverrides.get(trackId) ?? config?.pan ?? 0;
+  }
+
+  getMasterVolume(): number {
+    return this.masterVolumeOverride;
   }
 
   setTrackMuted(trackId: string, muted: boolean): void {
@@ -452,6 +506,9 @@ export class RealtimeAudioGraph {
   updateTrackEffects(trackId: string, effects: Effect[]): void {
     const config = this.trackConfigs.get(trackId);
     if (config) {
+      if (JSON.stringify(config.effects) === JSON.stringify(effects)) {
+        return;
+      }
       config.effects = effects;
       this.createTrack(config);
     }
@@ -486,7 +543,6 @@ export class RealtimeAudioGraph {
     source.playbackRate.value = schedule.speed;
 
     const clipGain = this.audioContext.createGain();
-    clipGain.gain.value = schedule.volume;
 
     source.connect(clipGain);
     clipGain.connect(trackNodes.inputGain);
@@ -497,17 +553,43 @@ export class RealtimeAudioGraph {
       this.masterClock.currentTime;
     const duration = schedule.endTime - schedule.startTime;
 
+    let playbackStartTime = contextStartTime;
+    let clipOffset = 0;
+    let playbackDuration = duration;
+
     if (contextStartTime > this.audioContext.currentTime) {
+      scheduleVolumeAutomationOnGain(
+        clipGain,
+        schedule.volumeAutomation,
+        schedule.volume,
+        clipOffset,
+        playbackDuration,
+        playbackStartTime,
+      );
       source.start(contextStartTime, schedule.mediaOffset, duration);
     } else {
-      const offset =
-        this.masterClock.currentTime -
-        schedule.startTime +
-        schedule.mediaOffset;
-      const remainingDuration =
-        duration - (this.masterClock.currentTime - schedule.startTime);
-      if (remainingDuration > 0 && offset < schedule.audioBuffer.duration) {
-        source.start(0, offset, remainingDuration);
+      clipOffset = this.masterClock.currentTime - schedule.startTime;
+      const sourceOffset = clipOffset + schedule.mediaOffset;
+      playbackDuration = duration - clipOffset;
+      playbackStartTime = this.audioContext.currentTime;
+
+      if (
+        playbackDuration > 0 &&
+        sourceOffset < schedule.audioBuffer.duration
+      ) {
+        scheduleVolumeAutomationOnGain(
+          clipGain,
+          schedule.volumeAutomation,
+          schedule.volume,
+          clipOffset,
+          playbackDuration,
+          playbackStartTime,
+        );
+        source.start(0, sourceOffset, playbackDuration);
+      } else {
+        source.disconnect();
+        clipGain.disconnect();
+        return;
       }
     }
 
@@ -515,7 +597,7 @@ export class RealtimeAudioGraph {
       clipId: schedule.clipId,
       source,
       startedAt: schedule.startTime,
-      duration,
+      duration: playbackDuration,
     };
 
     const sources = this.scheduledSources.get(schedule.trackId) || [];
@@ -583,7 +665,10 @@ export class RealtimeAudioGraph {
     if (this.schedulerIntervalId !== null) return;
 
     this.isPlaying = true;
-    this.lastScheduledTime = this.masterClock.currentTime;
+    if (!this.seekPending) {
+      this.lastScheduledTime = this.masterClock.currentTime;
+    }
+    this.seekPending = false;
 
     const scheduleAudio = () => {
       if (!this.isPlaying) return;
@@ -628,6 +713,7 @@ export class RealtimeAudioGraph {
   seekTo(time: number): void {
     this.stopAllClips();
     this.lastScheduledTime = time;
+    this.seekPending = true;
   }
 
   dispose(): void {

@@ -3,6 +3,10 @@ import { Shapes, FileCode, Smile } from "lucide-react";
 import type { ShapeClip, SVGClip, StickerClip } from "@openreel/core";
 import { ContextMenu, ContextMenuTrigger } from "@openreel/ui";
 import { GraphicsClipContextMenu } from "./GraphicsClipContextMenu";
+import { calculateSnap } from "./utils";
+import { useProjectStore } from "../../../stores/project-store";
+import { useTimelineStore } from "../../../stores/timeline-store";
+import { useUIStore } from "../../../stores/ui-store";
 
 type GraphicClipUnion = ShapeClip | SVGClip | StickerClip;
 
@@ -27,6 +31,8 @@ export const ShapeClipComponent: React.FC<ShapeClipComponentProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState(0);
   const [isTrimming, setIsTrimming] = useState<"left" | "right" | null>(null);
+  const { snapSettings } = useUIStore();
+  const { playheadPosition } = useTimelineStore();
   const trimStartRef = useRef<{
     mouseX: number;
     startTime: number;
@@ -83,10 +89,19 @@ export const ShapeClipComponent: React.FC<ShapeClipComponentProps> = ({
 
       const rect = timelineElement.getBoundingClientRect();
       const x = e.clientX - rect.left - dragOffset;
-      const rawTime = x / pixelsPerSecond;
-      const newStartTime = Math.max(0, rawTime);
-
-      onMoveClip(shapeClip.id, newStartTime);
+      const rawTime = Math.max(0, x / pixelsPerSecond);
+      const allTracks = useProjectStore.getState().project.timeline.tracks;
+      const dragSnapSettings = { ...snapSettings, snapToPlayhead: false };
+      const snapResult = calculateSnap(
+        rawTime,
+        shapeClip.id,
+        allTracks,
+        playheadPosition,
+        dragSnapSettings,
+        pixelsPerSecond,
+        shapeClip.duration,
+      );
+      onMoveClip(shapeClip.id, snapResult.time);
     };
 
     const handleMouseUp = () => {
@@ -100,7 +115,7 @@ export const ShapeClipComponent: React.FC<ShapeClipComponentProps> = ({
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("mouseup", handleMouseUp);
     };
-  }, [isDragging, dragOffset, pixelsPerSecond, shapeClip.id, onMoveClip]);
+  }, [isDragging, dragOffset, pixelsPerSecond, shapeClip.id, shapeClip.duration, onMoveClip, snapSettings, playheadPosition]);
 
   useEffect(() => {
     if (!isTrimming) return;
@@ -183,15 +198,23 @@ export const ShapeClipComponent: React.FC<ShapeClipComponentProps> = ({
           }}
         >
           <div
-            className={`absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-${colorClass}-400/50 z-20 opacity-0 group-hover:opacity-100 transition-opacity`}
+            className={`absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize z-20 flex items-center justify-center transition-opacity ${
+              isSelected ? "opacity-100 bg-green-400" : `opacity-0 group-hover:opacity-100 hover:bg-${colorClass}-400/50`
+            }`}
+            style={{ borderRadius: "6px 0 0 6px" }}
             onMouseDown={(e) => handleTrimStart(e, "left")}
-            title="Drag to trim start"
-          />
+          >
+            {isSelected && <div className="w-0.5 h-3 bg-green-900/60 rounded-full" />}
+          </div>
           <div
-            className={`absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-${colorClass}-400/50 z-20 opacity-0 group-hover:opacity-100 transition-opacity`}
+            className={`absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize z-20 flex items-center justify-center transition-opacity ${
+              isSelected ? "opacity-100 bg-green-400" : `opacity-0 group-hover:opacity-100 hover:bg-${colorClass}-400/50`
+            }`}
+            style={{ borderRadius: "0 6px 6px 0" }}
             onMouseDown={(e) => handleTrimStart(e, "right")}
-            title="Drag to trim end"
-          />
+          >
+            {isSelected && <div className="w-0.5 h-3 bg-green-900/60 rounded-full" />}
+          </div>
           <div className="w-full h-full flex items-center gap-1 px-3">
             <IconComponent
               size={12}
@@ -204,17 +227,7 @@ export const ShapeClipComponent: React.FC<ShapeClipComponentProps> = ({
             </span>
           </div>
           {isSelected && (
-            <>
-              <div className="absolute inset-0 border-2 border-green-400 rounded-lg pointer-events-none" />
-              <div
-                className="absolute left-0 top-1/2 -translate-y-1/2 w-1.5 h-6 bg-green-400 rounded-r cursor-ew-resize"
-                onMouseDown={(e) => handleTrimStart(e, "left")}
-              />
-              <div
-                className="absolute right-0 top-1/2 -translate-y-1/2 w-1.5 h-6 bg-green-400 rounded-l cursor-ew-resize"
-                onMouseDown={(e) => handleTrimStart(e, "right")}
-              />
-            </>
+            <div className="absolute inset-0 border-2 border-green-400 rounded-lg pointer-events-none" />
           )}
         </div>
       </ContextMenuTrigger>

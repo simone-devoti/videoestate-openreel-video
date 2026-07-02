@@ -10,6 +10,7 @@ import {
   Redo2,
   Layers,
   Maximize2,
+  Minimize2,
   Film,
   Music,
   Image,
@@ -21,14 +22,17 @@ import {
   Trash2,
   Plus,
   ChevronDown as ChevronDownIcon,
+  Magnet,
+  Rows3,
+  Rows2,
 } from "lucide-react";
 import { useProjectStore } from "../../stores/project-store";
 import { useTimelineStore } from "../../stores/timeline-store";
 import { useUIStore } from "../../stores/ui-store";
+import { toast } from "../../stores/notification-store";
 import { useEngineStore } from "../../stores/engine-store";
 import { getPlaybackBridge } from "../../bridges/playback-bridge";
 import {
-  IconButton,
   Popover,
   PopoverTrigger,
   PopoverContent,
@@ -88,14 +92,24 @@ export const Timeline: React.FC = () => {
     setViewportDimensions,
     zoomIn,
     zoomOut,
+    trackHeight,
+    setTrackHeight,
     setTrackHeightById,
     getTrackHeight,
   } = useTimelineStore();
 
   const [showLayersPanel, setShowLayersPanel] = useState(false);
 
-  const { select, selectMultiple, clearSelection, getSelectedClipIds } =
-    useUIStore();
+  const {
+    select,
+    selectMultiple,
+    clearSelection,
+    getSelectedClipIds,
+    snapSettings,
+    toggleSnap,
+    timelineMaximized,
+    toggleTimelineMaximized,
+  } = useUIStore();
   const selectedClipIds = getSelectedClipIds();
 
   const { getTitleEngine, getGraphicsEngine } = useEngineStore();
@@ -142,6 +156,17 @@ export const Timeline: React.FC = () => {
       }
     }
     return Math.max(maxEnd, 60); // Minimum 60 seconds
+  }, [tracks]);
+
+  const playheadSnapPoints = useMemo(() => {
+    const points = new Set<number>();
+    for (const track of tracks) {
+      for (const clip of track.clips) {
+        points.add(clip.startTime);
+        points.add(clip.startTime + clip.duration);
+      }
+    }
+    return Array.from(points).sort((a, b) => a - b);
   }, [tracks]);
 
   const totalTracksHeight = useMemo(() => {
@@ -208,13 +233,20 @@ export const Timeline: React.FC = () => {
 
   useEffect(() => {
     if (playbackState !== "playing") return;
+    const el = tracksRef.current;
+    if (!el) return;
 
     const playheadPixels = playheadPosition * pixelsPerSecond;
-    const visibleEnd = scrollX + viewportWidth - 150;
+    // Keep the playhead in the left portion of the viewport during playback so
+    // most of the upcoming timeline stays visible. When it crosses near the
+    // right edge (or jumps out of view via a seek/loop), page the view so the
+    // playhead lands back near the left with the rest as lookahead — instead of
+    // pinning it at the end on a long timeline.
+    const leftMargin = Math.min(Math.max(viewportWidth * 0.12, 60), 220);
+    const followThreshold = scrollX + viewportWidth - leftMargin;
 
-    if (playheadPixels > visibleEnd && tracksRef.current) {
-      const newScrollX = playheadPixels - viewportWidth + 200;
-      tracksRef.current.scrollLeft = Math.max(0, newScrollX);
+    if (playheadPixels > followThreshold || playheadPixels < scrollX) {
+      el.scrollLeft = Math.max(0, playheadPixels - leftMargin);
     }
   }, [playheadPosition, playbackState, pixelsPerSecond, scrollX, viewportWidth]);
 
@@ -470,9 +502,13 @@ export const Timeline: React.FC = () => {
   }, [isBoxSelecting, handleBoxSelectionEnd]);
 
   const handleDropMedia = useCallback(
-    async (_trackId: string, mediaId: string, startTime: number) => {
-      const { addClipToNewTrack } = useProjectStore.getState();
-      await addClipToNewTrack(mediaId, startTime);
+    async (trackId: string, mediaId: string, startTime: number) => {
+      const { addClip, addClipToNewTrack } = useProjectStore.getState();
+      if (trackId) {
+        await addClip(trackId, mediaId, startTime);
+      } else {
+        await addClipToNewTrack(mediaId, startTime);
+      }
     },
     [],
   );
@@ -671,198 +707,256 @@ export const Timeline: React.FC = () => {
 
   const visualOrderTracks = useMemo(() => tracks, [tracks]);
 
+  // Small, mockup-styled timeline tool button
+  const TLTool = ({
+    onClick,
+    disabled,
+    active,
+    title,
+    children,
+    extra,
+  }: {
+    onClick?: () => void;
+    disabled?: boolean;
+    active?: boolean;
+    title?: string;
+    children: React.ReactNode;
+    extra?: React.ReactNode;
+  }) => (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      data-tip={title}
+      title={title}
+      className={`w-[30px] h-[30px] grid place-items-center rounded-md transition-colors relative ${
+        active
+          ? "bg-accent-soft text-accent"
+          : disabled
+          ? "text-fg-muted opacity-50 cursor-not-allowed"
+          : "text-fg-2 hover:bg-hover hover:text-fg"
+      }`}
+    >
+      {children}
+      {extra}
+    </button>
+  );
+
   return (
     <div
       data-tour="timeline"
-      className="h-full bg-background border-t border-border flex flex-col"
+      className="h-full bg-tl-bg flex flex-col min-h-0 relative overflow-hidden"
     >
-      <div className="h-12 border-b border-border flex items-center justify-between px-4 bg-background-secondary relative z-[100]">
-        <div className="flex items-center gap-2">
-          <div className="flex bg-background-tertiary rounded-lg p-1 border border-border">
-            <IconButton
-              icon={Undo2}
-              onClick={undo}
-              disabled={!canUndo()}
-              title="Undo (Cmd+Z)"
-            />
-            <IconButton
-              icon={Redo2}
-              onClick={redo}
-              disabled={!canRedo()}
-              title="Redo (Cmd+Shift+Z)"
-            />
-          </div>
+      {/* ── Timeline toolbar (mockup pattern: compact 30px icons) ── */}
+      <div className="flex items-center px-3 py-1.5 gap-0.5 bg-bg-1 border-b border-border shrink-0 relative z-[100]">
+        <TLTool onClick={undo} disabled={!canUndo()} title="Undo (⌘Z)">
+          <Undo2 size={14} />
+        </TLTool>
+        <TLTool onClick={redo} disabled={!canRedo()} title="Redo (⇧⌘Z)">
+          <Redo2 size={14} />
+        </TLTool>
 
-          <div className="w-px h-6 bg-border mx-1" />
+        <div className="w-px h-4 bg-border mx-1.5" />
 
-          <div className="flex bg-background-tertiary rounded-lg p-1 border border-border gap-1">
+        <TLTool
+          onClick={handleSplit}
+          disabled={selectedClipIds.length !== 1}
+          title="Split (S)"
+        >
+          <Scissors size={14} />
+        </TLTool>
+        <TLTool
+          onClick={handleDelete}
+          disabled={selectedClipIds.length === 0}
+          title="Delete (Del)"
+        >
+          <Trash2 size={14} />
+        </TLTool>
+
+        <div className="w-px h-4 bg-border mx-1.5" />
+
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
             <button
-              onClick={handleSplit}
-              disabled={selectedClipIds.length !== 1}
-              title="Split clip at playhead (S)"
-              className={`flex items-center gap-1.5 px-2 py-1 rounded transition-colors ${
-                selectedClipIds.length === 1
-                  ? "bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 border border-orange-500/30"
-                  : "text-text-muted opacity-50 cursor-not-allowed"
+              data-tip="Add track"
+              title="Add track"
+              className="w-[30px] h-[30px] grid place-items-center rounded-md text-fg-2 hover:bg-hover hover:text-fg transition-colors relative"
+            >
+              <Plus size={14} />
+              <ChevronDownIcon size={8} className="absolute bottom-0.5 right-0.5 text-fg-3" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="top" align="start" sideOffset={8} className="w-48">
+            <DropdownMenuItem onClick={() => addTrack("video")}>
+              <Film size={16} className="text-clip-video" />
+              <span>Video Track</span>
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTrack("audio")}>
+              <Music size={16} className="text-clip-audio" />
+              <span>Audio Track</span>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => addTrack("image")}>
+              <Image size={16} className="text-clip-music" />
+              <span>Image Track</span>
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTrack("text")}>
+              <Type size={16} className="text-clip-text" />
+              <span>Text Track</span>
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTrack("graphics")}>
+              <Shapes size={16} className="text-clip-music" />
+              <span>Graphics Track</span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <Popover open={showLayersPanel} onOpenChange={setShowLayersPanel}>
+          <PopoverTrigger asChild>
+            <button
+              data-tip="Track layers"
+              title="Manage track layers"
+              className={`w-[30px] h-[30px] grid place-items-center rounded-md transition-colors ${
+                showLayersPanel
+                  ? "bg-accent-soft text-accent"
+                  : "text-fg-2 hover:bg-hover hover:text-fg"
               }`}
             >
-              <Scissors size={14} />
-              <span className="text-[10px] font-medium">SPLIT</span>
+              <Layers size={14} />
             </button>
-            <IconButton
-              icon={Trash2}
-              onClick={handleDelete}
-              disabled={selectedClipIds.length === 0}
-              title="Delete clip (Del)"
-              className="hover:text-red-500"
-            />
-          </div>
-
-          <div className="w-px h-6 bg-border mx-1" />
-
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 border border-primary/20 transition-colors"
-                title="Add new track"
-              >
-                <Plus size={14} />
-                <span className="text-[11px] font-semibold">Add Track</span>
-                <ChevronDownIcon size={12} className="ml-0.5 opacity-60" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent side="top" align="start" sideOffset={8} className="w-48">
-              <DropdownMenuItem onClick={() => addTrack("video")}>
-                <Film size={16} className="text-green-400" />
-                <span>Video Track</span>
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => addTrack("audio")}>
-                <Music size={16} className="text-blue-400" />
-                <span>Audio Track</span>
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => addTrack("image")}>
-                <Image size={16} className="text-purple-400" />
-                <span>Image Track</span>
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => addTrack("text")}>
-                <Type size={16} className="text-yellow-400" />
-                <span>Text Track</span>
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => addTrack("graphics")}>
-                <Shapes size={16} className="text-pink-400" />
-                <span>Graphics Track</span>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-
-          <div className="w-px h-6 bg-border mx-1" />
-
-          <Popover open={showLayersPanel} onOpenChange={setShowLayersPanel}>
-            <PopoverTrigger asChild>
-              <button
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg transition-colors ${
-                  showLayersPanel
-                    ? "bg-primary/20 text-primary"
-                    : "hover:bg-background-elevated text-text-secondary hover:text-text-primary"
-                }`}
-                title="Manage track layers"
-              >
-                <Layers size={14} />
-                <span className="text-[10px] font-medium tracking-wide">LAYERS</span>
-              </button>
-            </PopoverTrigger>
-            <PopoverContent
-              side="top"
-              align="start"
-              sideOffset={8}
-              className="w-64 p-0 bg-background-secondary border-border"
-            >
-              <div className="flex items-center justify-between px-3 py-2.5 border-b border-border bg-background-tertiary">
-                <span className="text-xs font-semibold text-text-primary">
-                  Track Layers
-                </span>
-              </div>
-              <div className="p-2 max-h-60 overflow-y-auto">
-                {tracks.length === 0 ? (
-                  <p className="text-xs text-text-muted text-center py-6">
-                    No tracks yet
-                  </p>
-                ) : (
-                  <div className="space-y-0.5">
-                    {tracks.map((track, index) => {
-                      const info = getTrackInfo(track, index);
-                      return (
+          </PopoverTrigger>
+          <PopoverContent
+            side="top"
+            align="start"
+            sideOffset={8}
+            className="w-64 p-0 bg-bg-1 border-border"
+          >
+            <div className="flex items-center justify-between px-3 py-2.5 border-b border-border bg-bg-2">
+              <span className="text-xs font-semibold text-fg">Track Layers</span>
+            </div>
+            <div className="p-2 max-h-60 overflow-y-auto">
+              {tracks.length === 0 ? (
+                <p className="text-xs text-fg-muted text-center py-6">
+                  No tracks yet
+                </p>
+              ) : (
+                <div className="space-y-0.5">
+                  {tracks.map((track, index) => {
+                    const info = getTrackInfo(track, index);
+                    return (
+                      <div
+                        key={track.id}
+                        className="flex items-center gap-2.5 px-2 py-2 rounded-md hover:bg-hover group transition-colors cursor-default"
+                      >
                         <div
-                          key={track.id}
-                          className="flex items-center gap-2.5 px-2 py-2 rounded-md hover:bg-background-tertiary group transition-colors cursor-default"
+                          className={`w-7 h-7 rounded-md flex items-center justify-center ${info.bgLight}`}
                         >
-                          <div
-                            className={`w-7 h-7 rounded-md flex items-center justify-center ${info.bgLight}`}
-                          >
-                            <info.icon size={14} className={info.textColor} />
-                          </div>
-                          <span className="text-[11px] font-medium text-text-primary flex-1 truncate">
-                            {track.name || info.label}
-                          </span>
-                          <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <button
-                              onClick={() =>
-                                index > 0 && reorderTrack(track.id, index - 1)
-                              }
-                              disabled={index === 0}
-                              className="p-1.5 rounded-md hover:bg-background-elevated disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                              title="Move up"
-                            >
-                              <ChevronUp size={12} />
-                            </button>
-                            <button
-                              onClick={() =>
-                                index < tracks.length - 1 &&
-                                reorderTrack(track.id, index + 1)
-                              }
-                              disabled={index === tracks.length - 1}
-                              className="p-1.5 rounded-md hover:bg-background-elevated disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                              title="Move down"
-                            >
-                              <ChevronDown size={12} />
-                            </button>
-                          </div>
+                          <info.icon size={14} className={info.textColor} />
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            </PopoverContent>
-          </Popover>
+                        <span className="text-[11px] font-medium text-fg flex-1 truncate">
+                          {track.name || info.label}
+                        </span>
+                        <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={() =>
+                              index > 0 && reorderTrack(track.id, index - 1)
+                            }
+                            disabled={index === 0}
+                            className="p-1.5 rounded-md hover:bg-hover disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                            title="Move up"
+                          >
+                            <ChevronUp size={12} />
+                          </button>
+                          <button
+                            onClick={() =>
+                              index < tracks.length - 1 &&
+                              reorderTrack(track.id, index + 1)
+                            }
+                            disabled={index === tracks.length - 1}
+                            className="p-1.5 rounded-md hover:bg-hover disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                            title="Move down"
+                          >
+                            <ChevronDown size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </PopoverContent>
+        </Popover>
+
+        {/* Centered timecode (mockup uses left-aligned tc-cur / tc-total in
+            the preview controls — timeline shows a compact monospace tc
+            in the toolbar centre). */}
+        <div className="mx-auto font-mono text-[11px] tabular-nums">
+          <span className="text-accent font-semibold">
+            {formatTimecode(playheadPosition)}
+          </span>
         </div>
 
-        <div className="font-mono text-primary text-sm font-bold tracking-wider bg-background-tertiary px-4 py-1.5 rounded-lg border border-primary/20 shadow-[0_0_12px_rgba(34,197,94,0.15)]">
-          {formatTimecode(playheadPosition)}
-        </div>
+        <div className="ml-auto flex items-center gap-0.5">
+          <TLTool
+            onClick={toggleSnap}
+            active={snapSettings.enabled}
+            title={snapSettings.enabled ? "Snap on (N)" : "Snap off (N)"}
+          >
+            <Magnet size={14} />
+          </TLTool>
 
-        <div className="flex items-center gap-2">
-          <div className="flex items-center bg-background-tertiary rounded-lg border border-border overflow-hidden">
-            <button
-              onClick={zoomOut}
-              className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-background-elevated transition-colors border-r border-border"
-              title="Zoom out"
-            >
-              <span className="text-base font-medium">−</span>
-            </button>
-            <span className="text-[11px] w-14 text-center font-mono text-text-secondary tabular-nums">
+          <div className="w-px h-4 bg-border mx-1.5" />
+
+          <TLTool
+            onClick={() => {
+              setTrackHeight(80);
+              useTimelineStore.setState({ trackHeights: {} });
+            }}
+            active={trackHeight >= 60}
+            title="Large tracks"
+          >
+            <Rows3 size={14} />
+          </TLTool>
+          <TLTool
+            onClick={() => {
+              setTrackHeight(50);
+              useTimelineStore.setState({ trackHeights: {} });
+            }}
+            active={trackHeight < 60}
+            title="Compact tracks"
+          >
+            <Rows2 size={14} />
+          </TLTool>
+
+          <div className="w-px h-4 bg-border mx-1.5" />
+
+          <div className="flex items-center gap-1.5 ml-1">
+            <TLTool onClick={zoomOut} title="Zoom out">
+              <span className="text-[15px] font-medium leading-none">−</span>
+            </TLTool>
+            <span className="text-[10px] w-12 text-center font-mono text-fg-3 tabular-nums">
               {Math.round(pixelsPerSecond)}px/s
             </span>
-            <button
-              onClick={zoomIn}
-              className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-background-elevated transition-colors border-l border-border"
-              title="Zoom in"
-            >
-              <span className="text-base font-medium">+</span>
-            </button>
+            <TLTool onClick={zoomIn} title="Zoom in">
+              <span className="text-[15px] font-medium leading-none">+</span>
+            </TLTool>
           </div>
-          <IconButton icon={Maximize2} title="Maximize timeline" />
+
+          <TLTool
+            onClick={toggleTimelineMaximized}
+            active={timelineMaximized}
+            title={
+              timelineMaximized
+                ? "Restore layout"
+                : "Maximize timeline (more room)"
+            }
+          >
+            {timelineMaximized ? (
+              <Minimize2 size={14} />
+            ) : (
+              <Maximize2 size={14} />
+            )}
+          </TLTool>
         </div>
       </div>
 
@@ -872,8 +966,8 @@ export const Timeline: React.FC = () => {
         onClick={handleBackgroundClick}
       >
         <div className="flex shrink-0">
-          <div className="w-32 h-8 bg-background-tertiary border-b border-r border-border shrink-0" />
-          <div className="flex-1 overflow-hidden relative">
+          <div className="w-32 h-[26px] bg-bg-1 border-b border-r border-border shrink-0" />
+          <div className="flex-1 overflow-hidden relative bg-bg-1 border-b border-border">
             <div
               style={{
                 width: `${timelineDuration * pixelsPerSecond}px`,
@@ -885,6 +979,7 @@ export const Timeline: React.FC = () => {
                 pixelsPerSecond={pixelsPerSecond}
                 scrollX={scrollX}
                 viewportWidth={viewportWidth}
+                snapPoints={playheadSnapPoints}
                 onSeek={(time) => {
                   const bridge = getPlaybackBridge();
                   bridge.scrubTo(time);
@@ -903,7 +998,7 @@ export const Timeline: React.FC = () => {
         </div>
 
         <div className="flex-1 flex overflow-hidden">
-          <div className="w-32 bg-background-secondary border-r border-border shrink-0 z-20 shadow-lg overflow-hidden">
+          <div className="w-32 bg-bg-1 border-r border-border shrink-0 z-20 overflow-hidden">
             <div
               className="flex flex-col"
               style={{ transform: `translateY(-${scrollY}px)` }}
@@ -941,6 +1036,87 @@ export const Timeline: React.FC = () => {
             }}
             onMouseDown={handleBoxSelectionStart}
             onMouseMove={handleBoxSelectionMove}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "copy";
+            }}
+            onDrop={async (e) => {
+              e.preventDefault();
+
+              const rect = tracksRef.current?.getBoundingClientRect();
+              if (!rect) return;
+              const x = e.clientX - rect.left + (tracksRef.current?.scrollLeft ?? 0);
+              const rawTime = Math.max(0, x / pixelsPerSecond);
+
+              const allClips = project.timeline.tracks.flatMap(t => t.clips);
+              let snappedTime = rawTime;
+              if (snapSettings.enabled) {
+                const threshold = snapSettings.snapThreshold / pixelsPerSecond;
+                let bestDist = Infinity;
+                for (const clip of allClips) {
+                  const clipEnd = clip.startTime + clip.duration;
+                  const distToEnd = Math.abs(rawTime - clipEnd);
+                  const distToStart = Math.abs(rawTime - clip.startTime);
+                  if (distToEnd < threshold && distToEnd < bestDist) {
+                    bestDist = distToEnd;
+                    snappedTime = clipEnd;
+                  }
+                  if (distToStart < threshold && distToStart < bestDist) {
+                    bestDist = distToStart;
+                    snappedTime = clip.startTime;
+                  }
+                }
+                if (snapSettings.snapToPlayhead) {
+                  const distToPlayhead = Math.abs(rawTime - playheadPosition);
+                  if (distToPlayhead < threshold && distToPlayhead < bestDist) {
+                    snappedTime = playheadPosition;
+                  }
+                }
+              }
+
+              // External OS file drop (e.g. from Windows Explorer)
+              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                const { importMedia, addClipToNewTrack } = useProjectStore.getState();
+                for (const file of Array.from(e.dataTransfer.files)) {
+                  try {
+                    const beforeIds = new Set(
+                      useProjectStore.getState().project.mediaLibrary.items.map(i => i.id)
+                    );
+                    const result = await importMedia(file);
+                    if (result.success) {
+                      const newItem = useProjectStore
+                        .getState()
+                        .project.mediaLibrary.items.find(i => !beforeIds.has(i.id));
+                      if (newItem) {
+                        await addClipToNewTrack(newItem.id, snappedTime);
+                        const track = useProjectStore
+                          .getState()
+                          .project.timeline.tracks.find(t =>
+                            t.clips.some(c => c.mediaId === newItem.id)
+                          );
+                        if (track) {
+                          toast.success(`Added to ${track.name}`, file.name);
+                        }
+                      }
+                    }
+                  } catch (err) {
+                    console.error("[Timeline] External file drop failed:", err);
+                  }
+                }
+                return;
+              }
+
+              // Internal drag from assets panel
+              try {
+                const rawData = e.dataTransfer.getData("application/json");
+                if (!rawData) return;
+                const data = JSON.parse(rawData);
+                if (!data?.mediaId) return;
+                handleDropMedia("", data.mediaId, snappedTime);
+              } catch {
+                // ignore
+              }
+            }}
           >
             <div
               style={{ width: `${timelineDuration * pixelsPerSecond}px` }}

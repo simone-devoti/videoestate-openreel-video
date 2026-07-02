@@ -137,13 +137,11 @@ async function initialize(
       }
     }
 
-    const isLongVideo = settings.width * settings.height > 1920 * 1080 || streamMode;
-
     videoSource = new VideoSampleSource({
       codec: videoCodec,
-      bitrate: QUALITY_MEDIUM,
+      bitrate: settings.bitrate ? settings.bitrate * 1000 : QUALITY_MEDIUM,
       keyFrameInterval: settings.keyframeInterval / settings.frameRate,
-      hardwareAcceleration: isLongVideo ? "prefer-software" : "prefer-hardware",
+      hardwareAcceleration: "prefer-hardware",
     });
 
     audioSource = new AudioSampleSource({
@@ -270,7 +268,7 @@ async function addAudio(audioData: {
 
 async function finalize() {
   while (frameQueue.length > 0 || isProcessing) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
 
   if (cancelled || !output || !videoSource || !audioSource || !target) {

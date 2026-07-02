@@ -7,6 +7,7 @@ import { Preview } from "./Preview";
 import { InspectorPanel } from "./InspectorPanel";
 import { Timeline } from "./Timeline";
 import { KeyframeEditorPanel } from "./KeyframeEditorPanel";
+import { AudioMixer } from "../audio-mixer";
 import { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
 import { PanelErrorBoundary } from "../ErrorBoundary";
 import { SpotlightTour, MoGraphTour } from "./tour";
@@ -38,6 +39,33 @@ import {
   initializeTransitionBridge,
   disposeTransitionBridge,
 } from "../../bridges/transition-bridge";
+
+// Timeline area (bottom band) is sized as a vh fraction so the
+// top workspace (media | stage | inspector) gets the rest. The grid
+// from the mockup is `1fr var(--tl-height)` rows — by default
+// timeline is 58vh which leaves the top row with ~38–42vh of stage.
+const DEFAULT_TIMELINE_VH = 42;
+const MIN_TIMELINE_VH = 22;
+const MAX_TIMELINE_VH = 70;
+// Compact mode: timeline takes most of the height, leaving a small preview.
+const COMPACT_TIMELINE_VH = 80;
+
+const DEFAULT_MEDIA_W = 460;
+const MIN_MEDIA_W = 320;
+const MAX_MEDIA_W = 640;
+
+const DEFAULT_INSPECTOR_W = 360;
+const MIN_INSPECTOR_W = 280;
+const MAX_INSPECTOR_W = 560;
+
+const MIN_STAGE_W = 380;
+const RESIZE_HANDLE = 4;
+
+type ResizeTarget = "timeline" | "media" | "inspector";
+
+const clamp = (value: number, min: number, max: number): number => {
+  return Math.min(Math.max(value, min), max);
+};
 
 /**
  * Auto-save initialization hook
@@ -160,7 +188,21 @@ const useEngineInitialization = () => {
 };
 
 /**
- * Main Editor Interface Component
+ * Main Editor Interface — v2 cinematic layout.
+ *
+ * Grid (per mockup):
+ *
+ *   ┌─────────────── topbar ───────────────┐
+ *   │                                      │
+ *   │  media │   stage   │   inspector     │  ← top row (auto-fit)
+ *   │   460  │   1fr     │      360        │
+ *   ├──────────────────────────────────────┤
+ *   │             timeline                 │  ← `tl-height` (vh)
+ *   └──────────────────────────────────────┘
+ *
+ * Column widths and timeline height are user-resizable via the
+ * dividers between panels. Values are persisted to CSS custom
+ * properties on the root grid so panels can pick them up.
  */
 export const EditorInterface: React.FC = () => {
   const { initialized, initializing, initError, initStatus } =
@@ -170,9 +212,15 @@ export const EditorInterface: React.FC = () => {
     useKeyboardShortcuts();
   useAutoSave();
 
-  const { keyframeEditorOpen, setKeyframeEditorOpen, getSelectedClipIds } = useUIStore();
-  const { project, updateClipKeyframes, importMedia, addClipToNewTrack } = useProjectStore();
-  const { params, updateParams } = useRouter();
+  const {
+    keyframeEditorOpen,
+    setKeyframeEditorOpen,
+    getSelectedClipIds,
+    panels,
+    setPanelVisible,
+    timelineMaximized,
+  } = useUIStore();
+  const { project, updateClipKeyframes } = useProjectStore();
   const tracks = project.timeline.tracks;
   const mediaUrlProcessedRef = useRef<string | null>(null);
   const [mediaLoadingProgress, setMediaLoadingProgress] = useState<{
@@ -186,7 +234,9 @@ export const EditorInterface: React.FC = () => {
   });
 
   const [selectedKeyframeIds, setSelectedKeyframeIds] = React.useState<string[]>([]);
-  const [copiedKeyframes, setCopiedKeyframes] = React.useState<import("@openreel/core").Keyframe[]>([]);
+  const [copiedKeyframes, setCopiedKeyframes] = React.useState<
+    import("@openreel/core").Keyframe[]
+  >([]);
 
   const selectedClip = React.useMemo(() => {
     const selectedIds = getSelectedClipIds();
@@ -200,47 +250,59 @@ export const EditorInterface: React.FC = () => {
   }, [getSelectedClipIds, tracks]);
 
   const handleUpdateKeyframe = React.useCallback(
-    (keyframeId: string, updates: Partial<import("@openreel/core").Keyframe>) => {
+    (
+      keyframeId: string,
+      updates: Partial<import("@openreel/core").Keyframe>,
+    ) => {
       if (!selectedClip?.keyframes) return;
       const keyframes = selectedClip.keyframes.map((kf) =>
-        kf.id === keyframeId ? { ...kf, ...updates } : kf
+        kf.id === keyframeId ? { ...kf, ...updates } : kf,
       );
       updateClipKeyframes(selectedClip.id, keyframes);
     },
-    [selectedClip, updateClipKeyframes]
+    [selectedClip, updateClipKeyframes],
   );
 
   const handleDeleteKeyframe = React.useCallback(
     (keyframeId: string) => {
       if (!selectedClip?.keyframes) return;
-      const keyframes = selectedClip.keyframes.filter((kf) => kf.id !== keyframeId);
+      const keyframes = selectedClip.keyframes.filter(
+        (kf) => kf.id !== keyframeId,
+      );
       updateClipKeyframes(selectedClip.id, keyframes);
       setSelectedKeyframeIds((prev) => prev.filter((id) => id !== keyframeId));
     },
-    [selectedClip, updateClipKeyframes]
+    [selectedClip, updateClipKeyframes],
   );
 
   const handleCopyKeyframes = React.useCallback(
     (keyframeIds: string[]) => {
       if (!selectedClip?.keyframes) return;
-      const toCopy = selectedClip.keyframes.filter((kf) => keyframeIds.includes(kf.id));
+      const toCopy = selectedClip.keyframes.filter((kf) =>
+        keyframeIds.includes(kf.id),
+      );
       setCopiedKeyframes(toCopy);
     },
-    [selectedClip]
+    [selectedClip],
   );
 
   const handlePasteKeyframes = React.useCallback(
     (clipId: string, time: number) => {
-      const targetClip = tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+      const targetClip = tracks
+        .flatMap((t) => t.clips)
+        .find((c) => c.id === clipId);
       if (!targetClip) return;
       const newKeyframes = copiedKeyframes.map((kf) => ({
         ...kf,
         id: `kf-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
         time: kf.time + time,
       }));
-      updateClipKeyframes(clipId, [...(targetClip.keyframes || []), ...newKeyframes]);
+      updateClipKeyframes(clipId, [
+        ...(targetClip.keyframes || []),
+        ...newKeyframes,
+      ]);
     },
-    [copiedKeyframes, tracks, updateClipKeyframes]
+    [copiedKeyframes, tracks, updateClipKeyframes],
   );
 
   const handleSelectKeyframe = React.useCallback(
@@ -249,276 +311,223 @@ export const EditorInterface: React.FC = () => {
         setSelectedKeyframeIds((prev) =>
           prev.includes(keyframeId)
             ? prev.filter((id) => id !== keyframeId)
-            : [...prev, keyframeId]
+            : [...prev, keyframeId],
         );
       } else {
         setSelectedKeyframeIds([keyframeId]);
       }
     },
-    []
+    [],
   );
 
-  const [timelineHeight, setTimelineHeight] = useState(320);
-  const isDraggingRef = useRef(false);
+  // ── Layout state (resizable columns and timeline band) ──────────
+  const rootRef = useRef<HTMLDivElement>(null);
+  const resizeRef = useRef<ResizeTarget | null>(null);
+  const [mediaWidth, setMediaWidth] = useState(DEFAULT_MEDIA_W);
+  const [inspectorWidth, setInspectorWidth] = useState(DEFAULT_INSPECTOR_W);
+  const [timelineVh, setTimelineVh] = useState(DEFAULT_TIMELINE_VH);
 
-  // Handle mediaUrl query parameter
+  const mediaRef = useRef(mediaWidth);
+  const inspectorRef = useRef(inspectorWidth);
   useEffect(() => {
-    // Only process if editor is initialized and we have a mediaUrl param
-    if (!initialized || !params.mediaUrl) {
-      return;
-    }
+    mediaRef.current = mediaWidth;
+  }, [mediaWidth]);
+  useEffect(() => {
+    inspectorRef.current = inspectorWidth;
+  }, [inspectorWidth]);
 
-    // Prevent duplicate processing of the same URL
-    if (mediaUrlProcessedRef.current === params.mediaUrl) {
-      return;
-    }
+  const beginResize = useCallback(
+    (target: ResizeTarget) => (e: React.MouseEvent) => {
+      e.preventDefault();
+      resizeRef.current = target;
+      document.body.style.cursor =
+        target === "timeline" ? "row-resize" : "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [],
+  );
 
-    const loadMediaFromUrl = async () => {
-      const url = params.mediaUrl!;
-      mediaUrlProcessedRef.current = url;
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const root = rootRef.current;
+      const target = resizeRef.current;
+      if (!root || !target) return;
+      const rect = root.getBoundingClientRect();
 
-      try {
-        // Set loading state
-        setMediaLoadingProgress({
-          isLoading: true,
-          progress: 0,
-          status: "Fetching media...",
-        });
-
-        // Fetch media from URL with progress tracking
-        const { file } = await fetchMediaFromUrl(url, {
-          onProgress: (loaded: number, total: number) => {
-            const progress = total > 0 && total >= loaded ? (loaded / total) * 100 : 0;
-            setMediaLoadingProgress({
-              isLoading: true,
-              progress,
-              status: total > 0 && total >= loaded
-                ? `Downloading... ${Math.round(progress)}%`
-                : "Downloading...",
-            });
-          },
-        });
-
-        setMediaLoadingProgress({
-          isLoading: true,
-          progress: 100,
-          status: "Importing media...",
-        });
-
-        // Import media
-        const importResult = await importMedia(file);
-
-        if (!importResult.success || !importResult.actionId) {
-          const errorMessage =
-            importResult.error?.message || "Failed to import media";
-          toast.error("Import failed", errorMessage);
-          // Clear the parameter even on failure to prevent retry loops
-          updateParams({ mediaUrl: undefined });
-          mediaUrlProcessedRef.current = null;
-          setMediaLoadingProgress({
-            isLoading: false,
-            progress: 0,
-            status: "",
-          });
-          return;
-        }
-
-        setMediaLoadingProgress({
-          isLoading: true,
-          progress: 100,
-          status: "Adding to timeline...",
-        });
-
-        // Add to timeline
-        const addResult = await addClipToNewTrack(importResult.actionId);
-
-        if (!addResult.success) {
-          const errorMessage =
-            addResult.error?.message || "Failed to add media to timeline";
-          toast.error("Failed to add to timeline", errorMessage);
-        } else {
-          toast.success(
-            "Media loaded",
-            `${file.name} has been imported and added to the timeline`,
-          );
-        }
-
-        // Clear the parameter after successful import
-        updateParams({ mediaUrl: undefined });
-        mediaUrlProcessedRef.current = null;
-        setMediaLoadingProgress({
-          isLoading: false,
-          progress: 0,
-          status: "",
-        });
-      } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : "Unknown error occurred";
-        
-        // Provide more specific error messages
-        if (errorMessage.includes("CORS")) {
-          toast.error(
-            "CORS error",
-            "The URL may not allow cross-origin access. The server needs to include appropriate CORS headers.",
-          );
-        } else if (errorMessage.includes("fetch")) {
-          toast.error("Network error", "Failed to fetch media from URL");
-        } else {
-          toast.error("Failed to load media", errorMessage);
-        }
-
-        // Clear the parameter on error to prevent retry loops
-        updateParams({ mediaUrl: undefined });
-        mediaUrlProcessedRef.current = null;
-        setMediaLoadingProgress({
-          isLoading: false,
-          progress: 0,
-          status: "",
-        });
+      if (target === "media") {
+        const maxByStage = rect.width - inspectorRef.current - MIN_STAGE_W;
+        setMediaWidth(
+          clamp(e.clientX - rect.left, MIN_MEDIA_W, Math.min(MAX_MEDIA_W, maxByStage)),
+        );
+        return;
       }
+      if (target === "inspector") {
+        const maxByStage = rect.width - mediaRef.current - MIN_STAGE_W;
+        setInspectorWidth(
+          clamp(
+            rect.right - e.clientX,
+            MIN_INSPECTOR_W,
+            Math.min(MAX_INSPECTOR_W, maxByStage),
+          ),
+        );
+        return;
+      }
+      // timeline: vh based on the distance from bottom of the viewport
+      const vh = ((window.innerHeight - e.clientY) / window.innerHeight) * 100;
+      setTimelineVh(clamp(vh, MIN_TIMELINE_VH, MAX_TIMELINE_VH));
     };
 
-    loadMediaFromUrl();
-  }, [initialized, params.mediaUrl, importMedia, addClipToNewTrack, updateParams]);
-
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    isDraggingRef.current = true;
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-  }, []);
-
-  useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isDraggingRef.current) return;
-
-      const newHeight = window.innerHeight - e.clientY;
-      const maxHeight = window.innerHeight * 0.6;
-      setTimelineHeight(Math.max(200, Math.min(newHeight, maxHeight)));
-    };
-
-    const handleMouseUp = () => {
-      isDraggingRef.current = false;
+    const onUp = () => {
+      resizeRef.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
 
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
     return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
     };
   }, []);
 
+  // Reflect resized panel sizes back into CSS variables so child styles
+  // (timeline header padding, etc.) can react.
+  useEffect(() => {
+    const r = rootRef.current;
+    if (!r) return;
+    const tlVh = timelineMaximized ? COMPACT_TIMELINE_VH : timelineVh;
+    r.style.setProperty("--media-w", `${mediaWidth}px`);
+    r.style.setProperty("--inspector-w", `${inspectorWidth}px`);
+    r.style.setProperty("--tl-height", `${tlVh}vh`);
+  }, [mediaWidth, inspectorWidth, timelineVh, timelineMaximized]);
+
   if (initializing || !initialized) {
     return (
-      <div className="w-full h-full bg-background flex items-center justify-center">
+      <div className="w-full h-full bg-bg flex items-center justify-center">
         <div className="text-center">
-          <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-text-secondary text-sm">Initializing editor...</p>
-          <p className="text-text-muted text-xs mt-2">{initStatus}</p>
+          <div className="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-fg-2 text-sm">Initializing editor…</p>
+          <p className="text-fg-muted text-xs mt-2">{initStatus}</p>
           {initError && (
-            <p className="text-red-500 text-xs mt-2">{initError}</p>
+            <p className="text-status-error text-xs mt-2">{initError}</p>
           )}
         </div>
       </div>
     );
   }
 
+  // ── Render ───────────────────────────────────────────────────────
+  // Grid template uses inline CSS for the resizable columns. The CSS
+  // variables `--media-w`, `--inspector-w`, `--tl-height` are kept in
+  // sync via the effect above so other components can use them too.
+  const effectiveTimelineVh = timelineMaximized
+    ? COMPACT_TIMELINE_VH
+    : timelineVh;
+  const gridStyle: React.CSSProperties = {
+    gridTemplateColumns: `${mediaWidth}px ${RESIZE_HANDLE}px 1fr ${RESIZE_HANDLE}px ${inspectorWidth}px`,
+    gridTemplateRows: `1fr ${RESIZE_HANDLE}px ${effectiveTimelineVh}vh`,
+    gridTemplateAreas:
+      "'media mh stage ih inspector' 'th th th th th' 'timeline timeline timeline timeline timeline'",
+  };
+
   return (
-    <div className="w-full h-full bg-background flex flex-col overflow-hidden font-sans select-none relative z-20 text-xs text-text-secondary">
-      {/* Media Loading Overlay */}
-      {mediaLoadingProgress.isLoading && (
-        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-background-secondary/95 rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl border border-border">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
-                <Loader2 size={20} className="text-primary animate-spin" />
-              </div>
-              <div>
-                <h3 className="text-sm font-semibold text-text-primary">
-                  Loading Media
-                </h3>
-                <p className="text-xs text-text-muted">
-                  {mediaLoadingProgress.status || "Please wait..."}
-                </p>
-              </div>
-            </div>
-
-            <div className="mb-4">
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-[10px] text-text-secondary">
-                  Download Progress
-                </span>
-                <span className="text-[10px] text-text-muted font-mono">
-                  {Math.round(mediaLoadingProgress.progress)}%
-                </span>
-              </div>
-              <Progress 
-                value={mediaLoadingProgress.progress} 
-                className="h-2 bg-black/30" 
-              />
-            </div>
-
-            <p className="text-[10px] text-text-muted text-center">
-              Please wait while media is being loaded...
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Main App Toolbar */}
+    <div
+      ref={rootRef}
+      className="w-full h-full bg-bg text-fg overflow-hidden font-sans select-none relative z-20 flex flex-col"
+    >
       <Toolbar />
 
-      {/* Workspace Area */}
-      <div className="flex-1 flex overflow-hidden">
-        <PanelErrorBoundary name="Assets Panel">
-          <AssetsPanel />
-        </PanelErrorBoundary>
-
-        <PanelErrorBoundary name="Preview">
-          <Preview />
-        </PanelErrorBoundary>
-
-        <PanelErrorBoundary name="Inspector">
-          <InspectorPanel />
-        </PanelErrorBoundary>
-
-        {keyframeEditorOpen && (
-          <PanelErrorBoundary name="Keyframe Editor">
-            <KeyframeEditorPanel
-              clip={selectedClip}
-              onClose={() => setKeyframeEditorOpen(false)}
-              onUpdateKeyframe={handleUpdateKeyframe}
-              onDeleteKeyframe={handleDeleteKeyframe}
-              onCopyKeyframes={handleCopyKeyframes}
-              onPasteKeyframes={handlePasteKeyframes}
-              selectedKeyframeIds={selectedKeyframeIds}
-              onSelectKeyframe={handleSelectKeyframe}
-              copiedKeyframes={copiedKeyframes}
-            />
+      <div
+        className="flex-1 min-h-0 grid gap-px bg-border"
+        style={gridStyle}
+      >
+        <div
+          className="bg-bg-1 min-w-0 min-h-0 overflow-hidden"
+          style={{ gridArea: "media" }}
+        >
+          <PanelErrorBoundary name="Media">
+            <AssetsPanel />
           </PanelErrorBoundary>
-        )}
-      </div>
+        </div>
 
-      {/* Resizable Handle */}
-      <div
-        className="h-1 bg-border hover:bg-primary/50 cursor-row-resize transition-colors z-10 relative group"
-        onMouseDown={handleMouseDown}
-      >
-        <div className="absolute inset-x-0 -top-1 -bottom-1 bg-transparent" />
-      </div>
+        <div
+          className="bg-border hover:bg-accent/50 cursor-col-resize transition-colors"
+          style={{ gridArea: "mh" }}
+          onMouseDown={beginResize("media")}
+        />
 
-      {/* BOTTOM PANEL: Timeline */}
-      <div
-        style={{ height: timelineHeight }}
-        className="shrink-0 flex flex-col"
-      >
-        <PanelErrorBoundary name="Timeline">
-          <Timeline />
-        </PanelErrorBoundary>
+        <div
+          className="bg-stage-bg min-w-0 min-h-0 overflow-hidden"
+          style={{ gridArea: "stage" }}
+        >
+          <PanelErrorBoundary name="Stage">
+            <Preview />
+          </PanelErrorBoundary>
+        </div>
+
+        <div
+          className="bg-border hover:bg-accent/50 cursor-col-resize transition-colors"
+          style={{ gridArea: "ih" }}
+          onMouseDown={beginResize("inspector")}
+        />
+
+        <div
+          className="bg-bg-1 min-w-0 min-h-0 overflow-hidden"
+          style={{ gridArea: "inspector" }}
+        >
+          <PanelErrorBoundary name="Inspector">
+            <InspectorPanel />
+          </PanelErrorBoundary>
+        </div>
+
+        <div
+          className="bg-border hover:bg-accent/50 cursor-row-resize transition-colors"
+          style={{ gridArea: "th" }}
+          onMouseDown={beginResize("timeline")}
+        />
+
+        <div
+          className="bg-tl-bg min-w-0 min-h-0 overflow-hidden flex flex-col"
+          style={{ gridArea: "timeline" }}
+        >
+          {panels.audioMixer?.visible && (
+            <div className="shrink-0 border-b border-border">
+              <PanelErrorBoundary name="Audio Mixer">
+                <AudioMixer
+                  visible
+                  onClose={() => setPanelVisible("audioMixer", false)}
+                />
+              </PanelErrorBoundary>
+            </div>
+          )}
+
+          <div className="flex-1 min-h-0 flex">
+            <div className="flex-1 min-w-0 min-h-0">
+              <PanelErrorBoundary name="Timeline">
+                <Timeline />
+              </PanelErrorBoundary>
+            </div>
+
+            {keyframeEditorOpen && (
+              <div className="shrink-0 min-w-0 border-l border-border">
+                <PanelErrorBoundary name="Keyframe Editor">
+                  <KeyframeEditorPanel
+                    clip={selectedClip}
+                    onClose={() => setKeyframeEditorOpen(false)}
+                    onUpdateKeyframe={handleUpdateKeyframe}
+                    onDeleteKeyframe={handleDeleteKeyframe}
+                    onCopyKeyframes={handleCopyKeyframes}
+                    onPasteKeyframes={handlePasteKeyframes}
+                    selectedKeyframeIds={selectedKeyframeIds}
+                    onSelectKeyframe={handleSelectKeyframe}
+                    copiedKeyframes={copiedKeyframes}
+                  />
+                </PanelErrorBoundary>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       <KeyboardShortcutsOverlay

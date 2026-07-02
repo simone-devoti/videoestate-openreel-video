@@ -14,6 +14,7 @@ export { NoiseReductionSection } from "./NoiseReductionSection";
 export { BackgroundRemovalSection } from "./BackgroundRemovalSection";
 export { CropSection } from "./CropSection";
 export { SpeedSection } from "./SpeedSection";
+export { StabilizationSection } from "./StabilizationSection";
 
 // Color Grading
 export { ColorGradingSection } from "./ColorGradingSection";
@@ -37,6 +38,7 @@ export { AudioTextSyncPanel } from "./AudioTextSyncPanel";
 // Graphics & Shapes
 export { ShapeSection } from "./ShapeSection";
 export { SVGSection } from "./SVGSection";
+export { AlignmentSection } from "./AlignmentSection";
 export { SVGImporter } from "./SVGImporter";
 export { StickerPicker } from "./StickerPicker";
 export { StickerPickerPanel } from "./StickerPickerPanel";
@@ -89,3 +91,7 @@ export { SceneNavigatorPanel } from "./SceneNavigatorPanel";
 
 // Particle Effects
 export { ParticleEffectsSection } from "./ParticleEffectsSection";
+
+// Text Behind Subject
+export { BehindSubjectSection } from "./BehindSubjectSection";
+

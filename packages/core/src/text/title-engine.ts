@@ -1,4 +1,4 @@
-import type { Transform, Keyframe } from "../types/timeline";
+import type { Transform, Keyframe, ClipMetadata } from "../types/timeline";
 import type {
   TextClip,
   TextStyle,
@@ -19,6 +19,7 @@ export interface CreateTextClipOptions {
   style?: Partial<TextStyle>;
   transform?: Partial<Transform>;
   animation?: TextAnimation;
+  metadata?: ClipMetadata;
 }
 
 export interface UpdateTextClipOptions {
@@ -32,6 +33,10 @@ export interface UpdateTextClipOptions {
   blendMode?: import("../video/types").BlendMode;
   blendOpacity?: number;
   emphasisAnimation?: import("../graphics/types").EmphasisAnimation;
+  behindSubject?: boolean;
+  metadata?: ClipMetadata;
+  /** Set or unset 3D extrusion settings for the text. */
+  text3d?: import("./types").Text3DSettings | undefined;
 }
 
 export class TitleEngine {
@@ -78,6 +83,7 @@ export class TitleEngine {
       transform,
       animation: options.animation,
       keyframes: [],
+      metadata: options.metadata,
     };
 
     this.textClips.set(id, textClip);
@@ -124,6 +130,10 @@ export class TitleEngine {
       blendOpacity: updates.blendOpacity ?? existing.blendOpacity,
       emphasisAnimation:
         updates.emphasisAnimation ?? existing.emphasisAnimation,
+      behindSubject:
+        updates.behindSubject ?? existing.behindSubject,
+      metadata: updates.metadata ?? existing.metadata,
+      text3d: "text3d" in updates ? updates.text3d : existing.text3d,
     };
 
     this.textClips.set(id, updatedClip);

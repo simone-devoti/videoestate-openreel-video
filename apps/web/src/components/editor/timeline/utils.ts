@@ -15,6 +15,7 @@ export const calculateSnap = (
   playheadPosition: number,
   snapSettings: SnapSettings,
   pixelsPerSecond: number,
+  clipDuration?: number,
 ): SnapResult => {
   if (!snapSettings.enabled) {
     return { time: rawTime, snapped: false };
@@ -44,21 +45,68 @@ export const calculateSnap = (
     const nearestGrid =
       Math.round(rawTime / snapSettings.gridSize) * snapSettings.gridSize;
     snapPoints.push({ time: nearestGrid, type: "grid" });
+    if (clipDuration) {
+      const endTime = rawTime + clipDuration;
+      const nearestEndGrid =
+        Math.round(endTime / snapSettings.gridSize) * snapSettings.gridSize;
+      snapPoints.push({ time: nearestEndGrid, type: "grid" });
+    }
   }
+
+  const priorityOrder: Record<string, number> = {
+    "clip-start": 0,
+    "clip-end": 0,
+    "playhead": 1,
+    "grid": 2,
+  };
 
   let closestPoint: SnapPoint | undefined;
   let closestDistance = Infinity;
+  let closestPriority = Infinity;
+  let snapFromEnd = false;
 
   for (const point of snapPoints) {
-    const distance = Math.abs(point.time - rawTime);
-    if (distance < thresholdSeconds && distance < closestDistance) {
-      closestDistance = distance;
-      closestPoint = point;
+    const pointPriority = priorityOrder[point.type] ?? 2;
+
+    const startDistance = Math.abs(point.time - rawTime);
+    if (startDistance < thresholdSeconds) {
+      const isBetter =
+        pointPriority < closestPriority ||
+        (pointPriority === closestPriority && startDistance < closestDistance);
+      if (isBetter) {
+        closestDistance = startDistance;
+        closestPriority = pointPriority;
+        closestPoint = point;
+        snapFromEnd = false;
+      }
+    }
+
+    if (clipDuration) {
+      const clipEndTime = rawTime + clipDuration;
+      const endDistance = Math.abs(point.time - clipEndTime);
+      if (endDistance < thresholdSeconds) {
+        const isBetter =
+          pointPriority < closestPriority ||
+          (pointPriority === closestPriority && endDistance < closestDistance);
+        if (isBetter) {
+          closestDistance = endDistance;
+          closestPriority = pointPriority;
+          closestPoint = point;
+          snapFromEnd = true;
+        }
+      }
     }
   }
 
   if (closestPoint) {
-    return { time: closestPoint.time, snapped: true, snapPoint: closestPoint };
+    const snappedTime = snapFromEnd
+      ? closestPoint.time - (clipDuration ?? 0)
+      : closestPoint.time;
+    return {
+      time: Math.max(0, snappedTime),
+      snapped: true,
+      snapPoint: { ...closestPoint, time: closestPoint.time },
+    };
   }
 
   return { time: rawTime, snapped: false };
@@ -158,34 +206,36 @@ export const getTrackInfo = (track: Track, index: number): TrackInfo => {
 };
 
 export const getClipStyle = (trackType: string): ClipStyle => {
+  // Clip palette matches the v2 mockup: video=cyan, audio=emerald,
+  // image=purple/music, text=amber.
   switch (trackType) {
     case "video":
       return {
-        bg: "bg-primary/10",
-        border: "border-primary/30",
+        bg: "bg-cyan-600/25",
+        border: "border-cyan-500/60",
         text: "text-white/90",
         selectedText: "text-white",
       };
     case "audio":
       return {
-        bg: "bg-blue-500/10",
-        border: "border-blue-500/30",
-        text: "text-text-secondary",
-        selectedText: "text-blue-400",
+        bg: "bg-emerald-600/25",
+        border: "border-emerald-500/60",
+        text: "text-white/85",
+        selectedText: "text-white",
       };
     case "image":
       return {
-        bg: "bg-purple-500/10",
-        border: "border-purple-500/30",
-        text: "text-purple-300",
-        selectedText: "text-purple-400",
+        bg: "bg-violet-600/25",
+        border: "border-violet-500/60",
+        text: "text-white/85",
+        selectedText: "text-white",
       };
     default:
       return {
-        bg: "bg-gray-500/10",
-        border: "border-gray-500/30",
-        text: "text-text-secondary",
-        selectedText: "text-text-primary",
+        bg: "bg-bg-2",
+        border: "border-border-strong",
+        text: "text-fg-2",
+        selectedText: "text-fg",
       };
   }
 };
