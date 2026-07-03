@@ -1,5 +1,4 @@
 import React, { useEffect, useState, useRef, useCallback } from "react";
-import { Loader2 } from "lucide-react";
 
 import { Toolbar } from "./Toolbar";
 import { AssetsPanel } from "./AssetsPanel";
@@ -15,10 +14,6 @@ import { useProjectStore } from "../../stores/project-store";
 import { useUIStore } from "../../stores/ui-store";
 import { useEngineStore } from "../../stores/engine-store";
 import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
-import { useRouter } from "../../hooks/use-router";
-import { importMediaFromUrl } from "../../utils/import-media-from-url";
-import { toast } from "../../stores/notification-store";
-import { Progress } from "@openreel/ui";
 import {
   initializePlaybackBridge,
   disposePlaybackBridge,
@@ -177,7 +172,7 @@ const useEngineInitialization = () => {
       disposeEffectsBridge();
       disposeTransitionBridge();
     };
-  }, [initialize, initialized, initializing]);
+  }, [initialize]);
 
   return {
     initialized: initialized && bridgesReady,
@@ -221,18 +216,7 @@ export const EditorInterface: React.FC = () => {
     timelineMaximized,
   } = useUIStore();
   const { project, updateClipKeyframes } = useProjectStore();
-  const { params, clearParams } = useRouter();
   const tracks = project.timeline.tracks;
-  const mediaUrlProcessedRef = useRef<string | null>(null);
-  const [mediaLoadingProgress, setMediaLoadingProgress] = useState<{
-    isLoading: boolean;
-    progress: number;
-    status: string;
-  }>({
-    isLoading: false,
-    progress: 0,
-    status: "",
-  });
 
   const [selectedKeyframeIds, setSelectedKeyframeIds] = React.useState<string[]>([]);
   const [copiedKeyframes, setCopiedKeyframes] = React.useState<
@@ -403,78 +387,6 @@ export const EditorInterface: React.FC = () => {
     r.style.setProperty("--tl-height", `${tlVh}vh`);
   }, [mediaWidth, inspectorWidth, timelineVh, timelineMaximized]);
 
-  useEffect(() => {
-    const mediaUrl = params.mediaUrl;
-    if (!initialized || !mediaUrl) return;
-    if (mediaUrlProcessedRef.current === mediaUrl) return;
-
-    mediaUrlProcessedRef.current = mediaUrl;
-    let cancelled = false;
-
-    const run = async () => {
-      setMediaLoadingProgress({
-        isLoading: true,
-        progress: 0,
-        status: "Downloading media...",
-      });
-
-      const result = await importMediaFromUrl(mediaUrl, {
-        onProgress: (loaded, total) => {
-          if (cancelled) return;
-          const progress =
-            total > 0 ? Math.round((loaded / total) * 100) : 0;
-          setMediaLoadingProgress((prev) => ({
-            ...prev,
-            progress,
-          }));
-        },
-        onStatus: (status) => {
-          if (cancelled) return;
-          setMediaLoadingProgress((prev) => ({
-            ...prev,
-            status,
-          }));
-        },
-      });
-
-      clearParams();
-
-      if (cancelled) return;
-
-      setMediaLoadingProgress({
-        isLoading: false,
-        progress: 0,
-        status: "",
-      });
-
-      if (result.success) {
-        toast.success("Media imported", result.fileName);
-      } else {
-        mediaUrlProcessedRef.current = null;
-        toast.error("Failed to import media", result.error);
-      }
-    };
-
-    run().catch((error) => {
-      if (cancelled) return;
-      mediaUrlProcessedRef.current = null;
-      clearParams();
-      setMediaLoadingProgress({
-        isLoading: false,
-        progress: 0,
-        status: "",
-      });
-      toast.error(
-        "Failed to import media",
-        error instanceof Error ? error.message : "Unknown error",
-      );
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [initialized, params.mediaUrl, clearParams]);
-
   if (initializing || !initialized) {
     return (
       <div className="w-full h-full bg-bg flex items-center justify-center">
@@ -610,20 +522,6 @@ export const EditorInterface: React.FC = () => {
 
       <SpotlightTour />
       <MoGraphTour />
-
-      {mediaLoadingProgress.isLoading && (
-        <div className="absolute inset-0 z-50 bg-bg/80 flex items-center justify-center">
-          <div className="bg-bg-1 border border-border rounded-lg p-6 w-80 shadow-xl">
-            <div className="flex items-center gap-3 mb-4">
-              <Loader2 className="w-5 h-5 animate-spin text-accent shrink-0" />
-              <span className="text-sm text-fg-2">
-                {mediaLoadingProgress.status}
-              </span>
-            </div>
-            <Progress value={mediaLoadingProgress.progress} />
-          </div>
-        </div>
-      )}
     </div>
   );
 };

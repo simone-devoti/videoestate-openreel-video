@@ -51,7 +51,6 @@ import { toast } from "../../stores/notification-store";
 import { useSettingsStore } from "../../stores/settings-store";
 import { useAnalytics, AnalyticsEvents } from "../../hooks/useAnalytics";
 import { startTour, ONBOARDING_KEY, startMoGraphTour, MOGRAPH_TOUR_KEY } from "./tour";
-import videoestateToolbarLogo from "../../assets/videoestate-toolbar-logo.svg";
 import {
   DropdownMenu,
   DropdownMenuTrigger,

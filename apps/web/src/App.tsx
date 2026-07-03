@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useRef, lazy, Suspense } from "react";
+import { useEffect, useLayoutEffect, useCallback, useRef, lazy, Suspense } from "react";
 import { ToastContainer } from "./components/Toast";
 import { ScriptViewDialog } from "./components/editor/ScriptViewDialog";
 import { SearchModal } from "./components/editor/SearchModal";
@@ -8,11 +8,14 @@ import { RecoveryDialog } from "./components/welcome/RecoveryDialog";
 import { SharePage } from "./pages/SharePage";
 import { useUIStore } from "./stores/ui-store";
 import { useProjectStore } from "./stores/project-store";
-import { useRouter } from "./hooks/use-router";
+import { useRouter, getMediaUrlFromLocation, pathnameImpliesNewProject } from "./hooks/use-router";
+import { useMediaUrlImport } from "./hooks/use-media-url-import";
 import { useProjectRecovery } from "./hooks/useProjectRecovery";
 import { useKieAIPoller } from "./hooks/useKieAIPoller";
+import { useMediaUrlImportStore } from "./stores/media-url-import-store";
 import { SOCIAL_MEDIA_PRESETS, type SocialMediaCategory } from "@openreel/core";
-import { TooltipProvider } from "@openreel/ui";
+import { TooltipProvider, Progress } from "@openreel/ui";
+import { Loader2 } from "lucide-react";
 
 const EditorInterface = lazy(() =>
   import("./components/editor/EditorInterface").then((m) => ({
@@ -46,10 +49,15 @@ function App() {
 
   useKieAIPoller();
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (hasHandledInitialRoute.current) return;
 
-    if (route === "new") {
+    const mediaUrl = params.mediaUrl ?? getMediaUrlFromLocation();
+    const wantsNewProject =
+      route === "new" ||
+      (route === "editor" && pathnameImpliesNewProject());
+
+    if (wantsNewProject) {
       hasHandledInitialRoute.current = true;
 
       let projectName = "New Project";
@@ -90,9 +98,16 @@ function App() {
       createNewProject(projectName, { width, height, frameRate });
       navigate(
         "editor",
-        params.mediaUrl ? { mediaUrl: params.mediaUrl } : undefined,
+        mediaUrl ? { mediaUrl } : undefined,
       );
-    } else if (route === "editor" && skipWelcomeScreen) {
+    } else if (
+      mediaUrl &&
+      ["welcome", "templates", "recent"].includes(route)
+    ) {
+      hasHandledInitialRoute.current = true;
+      createNewProject("New Project");
+      navigate("editor", { mediaUrl });
+    } else if (route === "editor") {
       hasHandledInitialRoute.current = true;
     } else if (["welcome", "templates", "recent"].includes(route)) {
       hasHandledInitialRoute.current = true;
@@ -106,6 +121,8 @@ function App() {
     navigate,
     skipWelcomeScreen,
   ]);
+
+  useMediaUrlImport(route, params);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
@@ -134,6 +151,11 @@ function App() {
         ? "recent"
         : undefined;
   const isSharePage = route === "share" && params.shareId;
+  const mediaUrlImport = useMediaUrlImportStore((state) => ({
+    isLoading: state.isLoading,
+    progress: state.progress,
+    status: state.status,
+  }));
 
   return (
     <TooltipProvider>
@@ -149,6 +171,19 @@ function App() {
           </Suspense>
         )}
         <ToastContainer />
+        {mediaUrlImport.isLoading && (
+          <div className="fixed inset-0 z-[100] bg-background/80 flex items-center justify-center">
+            <div className="bg-background border border-border rounded-lg p-6 w-80 shadow-xl">
+              <div className="flex items-center gap-3 mb-4">
+                <Loader2 className="w-5 h-5 animate-spin text-primary shrink-0" />
+                <span className="text-sm text-text-secondary">
+                  {mediaUrlImport.status || "Importing media..."}
+                </span>
+              </div>
+              <Progress value={mediaUrlImport.progress} />
+            </div>
+          </div>
+        )}
         <ScriptViewDialog
           isOpen={activeModal === "scriptView"}
           onClose={closeModal}

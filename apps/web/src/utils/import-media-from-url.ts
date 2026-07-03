@@ -1,5 +1,10 @@
 import { useProjectStore } from "../stores/project-store";
 import { fetchMediaFromUrl } from "./media-url-loader";
+import {
+  getMediaBridge,
+  initializeMediaBridge,
+} from "../bridges/media-bridge";
+import { useEngineStore } from "../stores/engine-store";
 
 export interface ImportMediaFromUrlOptions {
   onProgress?: (loaded: number, total: number) => void;
@@ -9,6 +14,33 @@ export interface ImportMediaFromUrlOptions {
 export type ImportMediaFromUrlResult =
   | { success: true; mediaId: string; fileName: string }
   | { success: false; error: string };
+
+async function ensureReadyForImport(): Promise<void> {
+  const engineState = useEngineStore.getState();
+  if (!engineState.initialized && !engineState.initializing) {
+    await engineState.initialize();
+  } else if (engineState.initializing) {
+    await new Promise<void>((resolve) => {
+      const unsubscribe = useEngineStore.subscribe((state) => {
+        if (state.initialized || state.initError) {
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+  }
+
+  if (!useEngineStore.getState().initialized) {
+    throw new Error(
+      useEngineStore.getState().initError || "Video engine failed to initialize",
+    );
+  }
+
+  const mediaBridge = getMediaBridge();
+  if (!mediaBridge.isInitialized()) {
+    await initializeMediaBridge();
+  }
+}
 
 /**
  * Fetch media from a URL, import it into the media library, and add it to the timeline.
@@ -20,6 +52,8 @@ export async function importMediaFromUrl(
   const { onProgress, onStatus } = options;
 
   try {
+    await ensureReadyForImport();
+
     onStatus?.("Downloading media...");
     const { file } = await fetchMediaFromUrl(url, { onProgress });
 
